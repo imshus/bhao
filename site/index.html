@@ -269,6 +269,121 @@ async function load() {
   }
 }
 
+// ---- direct mode: the browser polls the dealer feeds itself -------------
+// Every feed sends Access-Control-Allow-Origin: *, which is how the dealers'
+// own LiveRates pages work. Off localhost this needs no WebSocket and no
+// Lambda: each dealer is fetched every DIRECT_MS on its own clock. Mirrors
+// SOURCES / build_source_record in lambda_fetch/lambda_function.py. Mega
+// Bullion's login-only 99.50 rows can't be fetched here (no credentials in
+// the browser), so they stay blank as on the public feed.
+
+const DIRECT_MS = 500;
+const CANONICAL_LABELS = ["Gold Future MCX", "99.50 Gold Cash", "99.50 Gold RTGS"];
+const FEED = "https://bcast.%s:7768/VOTSBroadcastStreaming/Services/xml/GetLiveRateByTemplateID/";
+const DIRECT_SOURCES = [
+  { id: "jmd_patil", name: "JMD Patil", site_url: "https://jmdpatil.com/LiveRates.html",
+    url: FEED.replace("%s", "jmdpatil.com") + "jmd",
+    rows: [{ label: "GOLD FUTURE" }, { label: "99.50 GOLD" }, { label: "99.50 GOLD (RTGS)" }] },
+  { id: "mega_bullion", name: "Mega Bullion", site_url: "https://megabullion.info/LiveRates.html",
+    url: FEED.replace("%s", "megabullion.info") + "mega",
+    rows: [{ label: "GOLD FUTURE" },
+           { split: true, buy_label: "GOLD 99.50 LIVALI", sell_label: "GOLD 99.50 SELL" },
+           { label: "GOLD 99.50 RTGS", sell_col: 3 }] },
+  { id: "shri_sai", name: "Shri Sai Jewels", site_url: "http://www.shrisaijewels.in/",
+    url: FEED.replace("%s", "shrisaijewels.in") + "sai",
+    rows: [{ label: "GOLD FUTURE" }, null, { label: "Gold 9950 RTGS" }] },
+  { id: "shri_ganesh", name: "Shri Ganesh Bullion", site_url: "https://shriganeshbullion.com/",
+    url: FEED.replace("%s", "shriganeshbullion.com") + "shriganeshbullion",
+    rows: [{ label: "GOLD COSTING" }, null, null] },
+];
+
+function parseFeed(text) {
+  const out = [];
+  text.split(/\r?\n/).forEach(line => {
+    const parts = line.split("\t").map(p => p.trim());
+    while (parts.length && parts[0] === "") parts.shift();
+    while (parts.length && parts[parts.length - 1] === "") parts.pop();
+    if (parts.length < 6) return;
+    const [id, label, buy, sell, high, low] = parts;
+    out.push({ id, label, buy, sell, high, low });
+  });
+  return out;
+}
+
+function toInt(s) {
+  return typeof s === "string" && /^-?\d+$/.test(s.trim()) ? parseInt(s, 10) : null;
+}
+
+function rowNote(source, cfg, cells) {
+  if (cfg === null) return "This dealer does not publish this category";
+  if (cells.sell === null && cells.buy === null) {
+    return source.id === "mega_bullion"
+      ? "Published only on this dealer's customer template"
+      : "Row not present in the dealer's feed right now";
+  }
+  if (cells.buy === null || cells.buy === "-" || cells.buy === "") return "Dealer publishes no buy-back price for this row";
+  return null;
+}
+
+function buildRecord(source, feedRows) {
+  const find = label => feedRows.find(r => r.label === label) || null;
+  const rows = source.rows.map((cfg, i) => {
+    const cells = { buy: null, sell: null, high: null, low: null };
+    if (cfg && cfg.split) {
+      const b = find(cfg.buy_label), s = find(cfg.sell_label);
+      cells.buy = b ? b.buy : null;
+      cells.sell = s ? s.buy : null;
+      if (s) { cells.high = s.high; cells.low = s.low; }
+    } else if (cfg) {
+      const f = find(cfg.label);
+      if (f) {
+        Object.assign(cells, { buy: f.buy, sell: f.sell, high: f.high, low: f.low });
+        if (cfg.sell_col === 3) [cells.buy, cells.sell] = [cells.sell, cells.buy];
+      }
+    }
+    return Object.assign({ label: CANONICAL_LABELS[i] }, cells, { note: rowNote(source, cfg, cells) });
+  });
+
+  // Badla Bhaw: Cash / RTGS sell minus Gold Future MCX buy.
+  const f0 = toInt(rows[0].buy), s1 = toInt(rows[1].sell), s2 = toInt(rows[2].sell);
+  return {
+    source: source.id, name: source.name, site_url: source.site_url,
+    rows, all_rows: feedRows,
+    diff1: f0 !== null && s1 !== null ? s1 - f0 : null,
+    diff2: f0 !== null && s2 !== null ? s2 - f0 : null,
+  };
+}
+
+function startDirect() {
+  streaming = true;
+  paintStatus();
+  DIRECT_SOURCES.forEach((source, index) => {
+    let signature = null, last = null;
+    const tick = async () => {
+      const started = Date.now();
+      try {
+        const res = await fetch(source.url + "?t=" + started, { cache: "no-store" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const rec = buildRecord(source, parseFeed(await res.text()));
+        const now = new Date().toISOString();
+        const sig = JSON.stringify([rec.rows, rec.all_rows]);
+        rec.timestamp = now;
+        rec.changed_at = sig !== signature || !last ? now : last.changed_at;
+        rec.ok = true;
+        signature = sig;
+        last = rec;
+        applyRecord(rec);
+        cards.get(source.id).el.style.order = index;   // fixed order, whoever answers first
+        paintStatus();
+      } catch (e) {
+        if (last) { applyRecord(Object.assign({}, last, { ok: false, error: String(e) })); }
+      }
+      setTimeout(tick, Math.max(0, DIRECT_MS - (Date.now() - started)));
+    };
+    tick();
+  });
+}
+
 // ---- transport: WebSocket push when we can get it, polling otherwise ----
 
 let socket = null;
@@ -341,9 +456,18 @@ function connect() {
   };
 }
 
-document.getElementById("refresh").addEventListener("click", load);
-connect();
-if (!WS_URL) startPolling();
+// Localhost keeps the server's WebSocket; anywhere else the page goes
+// straight to the dealers (add ?ws to force the old WebSocket/API path).
+const DIRECT = !IS_LOCAL && !new URLSearchParams(location.search).has("ws");
+
+if (DIRECT) {
+  document.getElementById("refresh").style.display = "none";
+  startDirect();
+} else {
+  document.getElementById("refresh").addEventListener("click", load);
+  connect();
+  if (!WS_URL) startPolling();
+}
 </script>
 
 </body>
