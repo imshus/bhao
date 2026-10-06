@@ -22,7 +22,9 @@ command -v git >/dev/null || apt-get install -y git
 command -v python3 >/dev/null || apt-get install -y python3
 
 if [ -d "$APP_DIR/.git" ]; then
-  git -C "$APP_DIR" pull --ff-only
+  # The checkout is owned by $APP_USER (chown below) and this runs as root;
+  # without safe.directory git refuses with "dubious ownership" on re-runs.
+  git -c safe.directory="$APP_DIR" -C "$APP_DIR" pull --ff-only
 else
   git clone "$REPO" "$APP_DIR"
 fi

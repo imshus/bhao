@@ -20,7 +20,7 @@ CONNECTIONS_TABLE = os.environ.get("CONNECTIONS_TABLE", "")
 WS_ENDPOINT = os.environ.get("WS_ENDPOINT", "")
 STREAM_SECONDS = int(os.environ.get("STREAM_SECONDS", "840"))
 POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "2"))
-CONNECTION_CHECK_SECONDS = int(os.environ.get("CONNECTION_CHECK_SECONDS", "30"))
+CONNECTION_CHECK_SECONDS = int(os.environ.get("CONNECTION_CHECK_SECONDS", "10"))
 
 # Every source shows exactly these 3 rows, in this order. If a dealer's feed
 # doesn't publish that exact category, the row is left blank (None) rather
@@ -178,6 +178,9 @@ def find_row(feed_rows, label):
 
 _TEMPLATE_CACHE = {}
 TEMPLATE_CACHE_SECONDS = 15 * 60
+# A failed lookup (wrong login, endpoint down) is remembered too, so a 500ms
+# poller doesn't hit the dealer's login endpoint on every round.
+TEMPLATE_RETRY_SECONDS = 5 * 60
 
 
 def fetch_template_id(source):
@@ -192,9 +195,17 @@ def fetch_template_id(source):
         return None
 
     cached = _TEMPLATE_CACHE.get(source["id"])
-    if cached and time.time() - cached[1] < TEMPLATE_CACHE_SECONDS:
-        return cached[0]
+    if cached:
+        ttl = TEMPLATE_CACHE_SECONDS if cached[0] else TEMPLATE_RETRY_SECONDS
+        if time.time() - cached[1] < ttl:
+            return cached[0]
 
+    template = _lookup_template(source, cfg, user, password)
+    _TEMPLATE_CACHE[source["id"]] = (template, time.time())
+    return template
+
+
+def _lookup_template(source, cfg, user, password):
     url = cfg["url"].format(
         user=urllib.parse.quote(user, safe=""),
         password=urllib.parse.quote(password, safe=""),
@@ -216,9 +227,9 @@ def fetch_template_id(source):
     raw = raw.strip('"').strip()
 
     if not re.match(r"^[A-Za-z0-9_-]+$", raw) or raw.lower() in ("null", "undefined", "0", "-1"):
+        print("template lookup for %s returned no usable template id" % source["id"])
         return None
 
-    _TEMPLATE_CACHE[source["id"]] = (raw, time.time())
     return raw
 
 
@@ -384,7 +395,9 @@ def fetch_all(timestamp):
 
 
 def signature_of(record):
-    return json.dumps([record["rows"], record["diff1"], record["diff2"]],
+    # all_rows too, like local_server.rate_signature: the page renders every
+    # feed row, so a move in spot gold or USD-INR alone must still push.
+    return json.dumps([record["rows"], record.get("all_rows"), record["diff1"], record["diff2"]],
                       sort_keys=True, default=str)
 
 
@@ -446,6 +459,7 @@ def stream(event, context):
         deadline = min(deadline, time.time() + context.get_remaining_time_in_millis() / 1000.0 - 5)
 
     signatures = {}
+    latest = {}        # source -> newest record, for viewers who join mid-stream
     rounds = 0
     pushes = 0
     last_connection_check = time.time()
@@ -463,6 +477,9 @@ def stream(event, context):
                 signatures[record["source"]] = signature
                 record["changed_at"] = timestamp
                 changed.append(record)
+            else:
+                record["changed_at"] = latest[record["source"]].get("changed_at", timestamp)
+            latest[record["source"]] = record
 
         rounds += 1
         if changed:
@@ -477,9 +494,16 @@ def stream(event, context):
         # and departures without scanning the table every round.
         if time.time() - last_connection_check > CONNECTION_CHECK_SECONDS:
             last_connection_check = time.time()
+            previous = set(connection_ids)
             connection_ids = list_connections()
             if not connection_ids:
                 break
+            # A viewer who joined mid-stream only got the stored (up to 30 min
+            # old) snapshot; dealers that haven't moved since would never be
+            # pushed to them. Send them every dealer's current record once.
+            joined = [c for c in connection_ids if c not in previous]
+            if joined and latest:
+                push_to_connections({"type": "update", "sources": list(latest.values())}, joined)
 
         elapsed = time.time() - round_started
         if elapsed < POLL_SECONDS:

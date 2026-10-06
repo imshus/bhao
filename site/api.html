@@ -14,21 +14,25 @@
 <body>
 <pre id="out">Connecting…</pre>
 <script>
-// /api opened in a browser tab gets this page instead of a frozen JSON
-// snapshot: the exact JSON /api returns, kept live by streaming /api/stream
-// (Server-Sent Events) - a snapshot first, then each dealer's record the
-// moment its rate moves. Scripts and apps calling /api still get raw JSON
-// (local_server.py decides by the Accept header; /api?raw forces raw JSON).
+// /api or /api/stream opened in a browser tab gets this page: ONE JSON
+// document - exactly what /api returns - updated in place. Every event on
+// /api/stream is that complete JSON, so each one simply replaces the last.
+// /api/3min and /api/3min/stream do the same with the /api/3min JSON, which
+// changes once every 3 minutes. Scripts and apps still get raw JSON
+// (local_server.py decides by the Accept header; ?raw forces raw output).
 const out = document.getElementById("out");
 const SILENT_MS = 60000;            // the server heartbeats every 20s
+const STREAM_URL = /^\/+api\/+3min/.test(location.pathname) ? "/api/3min/stream" : "/api/stream";
 
-let records = [];                   // same order as /api
 let last = "";
 let lastEventAt = Date.now();
 let stream = null;
 
-function paint() {
-  const text = JSON.stringify(records, null, 2);
+function onData(ev) {
+  lastEventAt = Date.now();
+  let data;
+  try { data = JSON.parse(ev.data); } catch (e) { return; }
+  const text = JSON.stringify(data, null, 2);
   // Don't wipe out text the user is selecting to copy.
   if (text !== last && !String(window.getSelection())) {
     last = text;
@@ -36,28 +40,12 @@ function paint() {
   }
 }
 
-function onMessage(ev) {
-  lastEventAt = Date.now();
-  let msg;
-  try { msg = JSON.parse(ev.data); } catch (e) { return; }
-  if (msg.type === "snapshot") {
-    records = msg.sources || [];
-  } else if (msg.type === "update") {
-    (msg.sources || (msg.source ? [msg.source] : [])).forEach(rec => {
-      const i = records.findIndex(r => r.source === rec.source);
-      if (i === -1) records.push(rec); else records[i] = rec;
-    });
-  } else {
-    return;                         // heartbeat
-  }
-  paint();
-}
-
 function openStream() {
   if (stream) stream.close();
   lastEventAt = Date.now();
-  stream = new EventSource("/api/stream");
-  stream.onmessage = onMessage;     // EventSource reconnects by itself on errors
+  stream = new EventSource(STREAM_URL);
+  stream.onmessage = onData;        // EventSource reconnects by itself on errors
+  stream.addEventListener("heartbeat", () => { lastEventAt = Date.now(); });
 }
 
 // A stream that stays open but goes silent (stalled proxy, laptop sleep) is

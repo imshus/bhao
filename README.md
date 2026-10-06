@@ -138,12 +138,18 @@ Live endpoints on the server:
 |---|---|
 | `/` | dashboard (WebSocket push) |
 | `/ws` | WebSocket: `{"type":"snapshot"}` on connect, then `{"type":"update","source":{...}}` per dealer change, `{"type":"heartbeat"}` every 20s |
-| `/api/stream` | the same messages as Server-Sent Events (`data: {...}` lines) over plain HTTPS |
-| `/api` | JSON snapshot for scripts; opened in a browser tab it streams off `/api/stream` and stays live. `/api?raw` always returns plain JSON |
+| `/api` | JSON snapshot of every dealer |
+| `/api/stream` | Server-Sent Events: every `data:` event is the complete `/api` JSON, sent on connect and again the moment any rate moves |
 | `/api/3min` | every dealer, refetched once every 3 minutes |
+| `/api/3min/stream` | Server-Sent Events: the complete `/api/3min` JSON on connect and after each 3-minute refetch |
 
-`/api/stream` sends `X-Accel-Buffering: no`, so nginx passes each event
-through as-is with no extra config.
+Opened in a browser tab, any of the four `/api...` URLs shows one JSON
+document that updates in place (`site/api.html`) instead of a frozen
+snapshot or a growing list of events; scripts and apps get raw JSON or the
+raw event stream, decided by the `Accept` header. `?raw` forces the raw
+output in a browser. Both streams also send `event: heartbeat` every 20s and
+`X-Accel-Buffering: no`, so nginx passes each event through with no extra
+config. `/api/streaming` and `/api/3min/streaming` are aliases.
 
 How the page picks its transport, wherever it's hosted:
 

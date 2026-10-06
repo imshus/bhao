@@ -10,8 +10,9 @@ It serves three things on one port:
   * /ws          -> WebSocket; new rates are PUSHED the moment they change
   * /api         -> the same JSON the deployed API Gateway returns (fallback)
   * /api/3min    -> every dealer, refetched once every 3 minutes
-  * /api/stream  -> Server-Sent Events: the same pushes as /ws, over plain HTTP
-                    (/api opened in a browser tab streams off this too)
+  * /api/stream  -> Server-Sent Events: the full /api JSON on every rate move
+  * /api/3min/stream -> Server-Sent Events: the full /api/3min JSON every 3 minutes
+                    (opened in a browser tab, any /api URL is one JSON updating in place)
 
 About "live": the dealers' feed (Chirayu / VOTSBroadcastStreaming) has no
 WebSocket or SSE endpoint - their own LiveRates page just re-GETs the same URL
@@ -34,6 +35,9 @@ import hashlib
 import json
 import mimetypes
 import os
+import queue
+import re
+import socket
 import struct
 import sys
 import threading
@@ -92,92 +96,159 @@ def rate_signature(record):
 # WebSocket (RFC 6455, stdlib only - the project deliberately has no deps)
 # --------------------------------------------------------------------------
 
-class WSClient:
-    """One connected browser. Writes are locked: several poller threads can
-    broadcast at once while this connection's own thread replies to a ping."""
+class PushClient:
+    """One connected listener. send() never touches the socket: it queues the
+    bytes, and the client's own writer thread drains the queue. A tab that
+    stops reading (phone asleep, stalled proxy) therefore only fills its own
+    queue - it can't block broadcast() and freeze every other viewer. Past
+    QUEUE_LIMIT queued messages the client is dropped."""
+
+    QUEUE_LIMIT = 256
 
     def __init__(self, sock):
         self.sock = sock
-        self.lock = threading.Lock()
         self.alive = True
+        self.closed = threading.Event()
+        self._lock = threading.Lock()
+        self._queue = queue.Queue(self.QUEUE_LIMIT)
+        threading.Thread(target=self._writer, daemon=True, name="push-writer").start()
 
-    def send(self, payload, opcode=0x1):
-        if isinstance(payload, str):
-            payload = payload.encode("utf-8")
-        n = len(payload)
-        if n < 126:
-            header = struct.pack("!BB", 0x80 | opcode, n)
-        elif n < (1 << 16):
-            header = struct.pack("!BBH", 0x80 | opcode, 126, n)
-        else:
-            header = struct.pack("!BBQ", 0x80 | opcode, 127, n)
-        with self.lock:
-            if not self.alive:
-                return False
+    @staticmethod
+    def encode_message(message):
+        """Bytes for one JSON message ({"type": ...}), or None to skip it.
+        Static so broadcast() can encode once per client type."""
+        raise NotImplementedError
+
+    @staticmethod
+    def encode_control(opcode, data):
+        """Bytes for a WebSocket control frame (ping/pong), or None."""
+        raise NotImplementedError
+
+    def send_message(self, message, encoded=None):
+        return self._enqueue(self.encode_message(message) if encoded is None else encoded)
+
+    def send_control(self, opcode, data=b""):
+        return self._enqueue(self.encode_control(opcode, data))
+
+    def _enqueue(self, data):
+        if not self.alive:
+            return False
+        if data is None:
+            return True
+        try:
+            self._queue.put_nowait(data)
+            return True
+        except queue.Full:
+            self.close()
+            return False
+
+    def _writer(self):
+        while True:
+            data = self._queue.get()
+            if data is None or not self.alive:
+                break
             try:
-                self.sock.sendall(header + payload)
-                return True
+                self.sock.sendall(data)
             except OSError:
-                self.alive = False
-                return False
+                break
+        self.close()
 
     def close(self):
-        with self.lock:
+        with self._lock:
+            if not self.alive:
+                return
             self.alive = False
+        self.closed.set()
         try:
-            self.sock.close()
+            # Wakes a writer stuck in sendall and the reader stuck in recv.
+            self.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
+            pass
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
             pass
 
 
-class SSEClient:
-    """One /api/stream listener (Server-Sent Events). Same send() interface as
-    WSClient, so broadcast() and keepalive_loop() push to both alike: text
-    frames become `data:` events, pings become SSE comments."""
-
-    def __init__(self, wfile):
-        self.wfile = wfile
-        self.lock = threading.Lock()
-        self.alive = True
-        self.closed = threading.Event()
-
-    def send(self, payload, opcode=0x1):
-        if opcode == 0x9:
-            chunk = b": ping\n\n"
-        elif opcode != 0x1:
-            return True
-        else:
-            if isinstance(payload, bytes):
-                payload = payload.decode("utf-8")
-            chunk = ("data: " + payload + "\n\n").encode("utf-8")
-        with self.lock:
-            if not self.alive:
-                return False
-            try:
-                self.wfile.write(chunk)
-                self.wfile.flush()
-                return True
-            except OSError:
-                self.alive = False
-                self.closed.set()
-                return False
-
-    def close(self):
-        with self.lock:
-            self.alive = False
-        self.closed.set()
+def ws_frame(payload, opcode=0x1):
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8")
+    n = len(payload)
+    if n < 126:
+        header = struct.pack("!BB", 0x80 | opcode, n)
+    elif n < (1 << 16):
+        header = struct.pack("!BBH", 0x80 | opcode, 126, n)
+    else:
+        header = struct.pack("!BBQ", 0x80 | opcode, 127, n)
+    return header + payload
 
 
-CLIENTS = set()     # WSClient and SSEClient instances
+class WSClient(PushClient):
+    """A browser on /ws: a snapshot on connect, then one update per dealer
+    change, as WebSocket text frames (the dashboard merges them)."""
+
+    @staticmethod
+    def encode_message(message):
+        if message.get("type") == "3min":
+            return None          # that one is for /api/3min/stream only
+        return ws_frame(json.dumps(message, default=str))
+
+    @staticmethod
+    def encode_control(opcode, data):
+        return ws_frame(data, opcode)
+
+
+class SSEClient(PushClient):
+    """A listener on /api/stream (Server-Sent Events). Every `data:` event is
+    the complete /api JSON - the same array, same shape, every time - so a
+    consumer just replaces what it has; nothing to merge. Heartbeats are a
+    separate named event so the data events stay pure /api JSON."""
+
+    @staticmethod
+    def encode_message(message):
+        if message.get("type") == "heartbeat":
+            return ("event: heartbeat\ndata: " + json.dumps(message) + "\n\n").encode("utf-8")
+        if message.get("type") == "3min":
+            return None
+        return ("data: " + json.dumps(snapshot(), default=str) + "\n\n").encode("utf-8")
+
+    @staticmethod
+    def encode_control(opcode, data):
+        return b": ping\n\n" if opcode == 0x9 else None
+
+
+class ThreeMinSSEClient(SSEClient):
+    """A listener on /api/3min/stream: every `data:` event is the complete
+    /api/3min JSON, sent on connect and again after each 3-minute refetch.
+    Live per-dealer moves are not sent here - that's what /api/stream is for."""
+
+    @staticmethod
+    def encode_message(message):
+        if message.get("type") == "heartbeat":
+            return ("event: heartbeat\ndata: " + json.dumps(message) + "\n\n").encode("utf-8")
+        if message.get("type") != "3min":
+            return None
+        with THREE_MIN_LOCK:
+            body = json.dumps(THREE_MIN, default=str)
+        return ("data: " + body + "\n\n").encode("utf-8")
+
+
+CLIENTS = set()     # WSClient, SSEClient and ThreeMinSSEClient instances
 CLIENTS_LOCK = threading.Lock()
 
 
 def broadcast(message):
-    """Send one JSON message to every connected browser."""
-    text = json.dumps(message, default=str)
+    """Send one message to every connected listener, encoded once per type."""
     with CLIENTS_LOCK:
         targets = list(CLIENTS)
-    dead = [c for c in targets if not c.send(text)]
+    encoded = {}
+    dead = []
+    for c in targets:
+        kind = type(c)
+        if kind not in encoded:
+            encoded[kind] = kind.encode_message(message)
+        if not c.send_message(message, encoded[kind]):
+            dead.append(c)
     if dead:
         with CLIENTS_LOCK:
             for c in dead:
@@ -185,13 +256,19 @@ def broadcast(message):
 
 
 def _read_exactly(sock, n):
-    buf = b""
+    buf = bytearray()
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
         if not chunk:
             return None
         buf += chunk
-    return buf
+    return bytes(buf)
+
+
+# The page only ever sends tiny JSON ({"action": "snapshot"} / "ping") and
+# control frames are capped at 125 bytes by the RFC, so anything bigger is
+# not our page - drop it rather than buffer whatever length a client claims.
+MAX_CLIENT_FRAME = 4096
 
 
 def ws_read_loop(client):
@@ -218,6 +295,9 @@ def ws_read_loop(client):
                 break
             length = struct.unpack("!Q", ext)[0]
 
+        if length > MAX_CLIENT_FRAME:
+            break
+
         mask = b""
         if masked:
             mask = _read_exactly(sock, 4)
@@ -235,7 +315,7 @@ def ws_read_loop(client):
         if opcode == 0x8:      # close
             break
         if opcode == 0x9:      # ping -> pong
-            client.send(data, opcode=0xA)
+            client.send_control(0xA, data)
         # 0xA (pong) and any data frames are ignored on purpose.
 
 
@@ -247,16 +327,9 @@ def keepalive_loop(stop_event):
     while not stop_event.wait(PING_EVERY_SECONDS):
         with CLIENTS_LOCK:
             targets = list(CLIENTS)
-        heartbeat = json.dumps({"type": "heartbeat", "at": now_ist()})
-        dead = []
         for c in targets:
-            c.send(b"", opcode=0x9)
-            if not c.send(heartbeat):
-                dead.append(c)
-        if dead:
-            with CLIENTS_LOCK:
-                for c in dead:
-                    CLIENTS.discard(c)
+            c.send_control(0x9)
+        broadcast({"type": "heartbeat", "at": now_ist()})
 
 
 # --------------------------------------------------------------------------
@@ -376,6 +449,7 @@ def three_min_loop(stop_event):
                 "sources": sources,
                 "errors": errors,
             })
+        broadcast({"type": "3min"})     # /api/3min/stream listeners get the new JSON
         if stop_event.wait(max(0.0, THREE_MIN_SECONDS - (time.time() - started))):
             return
 
@@ -409,6 +483,13 @@ def dynamo_payload():
 # HTTP
 # --------------------------------------------------------------------------
 
+# URLs that, opened in a browser tab, show one live-updating JSON (api.html).
+LIVE_JSON_PATHS = (
+    "/api", "/api/stream", "/api/streaming",
+    "/api/3min", "/api/3min/stream", "/api/3min/streaming",
+)
+
+
 class Handler(BaseHTTPRequestHandler):
     mode = "live"
     protocol_version = "HTTP/1.1"
@@ -426,10 +507,13 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- server-sent events --------------------------------------------------
 
-    def _handle_stream(self):
-        """/api/stream: the same pushes the WebSocket gets, over plain HTTP.
-        One `data:` line per message - a snapshot first, then an update per
-        dealer the moment its rate moves, and a heartbeat every 20s."""
+    def _handle_stream(self, client_cls, first_message):
+        """Server-Sent Events over plain HTTP.
+          /api/stream       SSEClient: each `data:` event is the complete /api
+                            JSON - on connect, then the moment any rate moves.
+          /api/3min/stream  ThreeMinSSEClient: the complete /api/3min JSON - on
+                            connect, then after each 3-minute refetch.
+        Both get an `event: heartbeat` every 20s."""
         if self.mode != "live":
             self._send(501, b"Streaming disabled in --dynamo mode", "text/plain")
             return
@@ -443,13 +527,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
-        client = SSEClient(self.wfile)
+        client = client_cls(self.connection)
         with CLIENTS_LOCK:
             CLIENTS.add(client)
             count = len(CLIENTS)
         print("sse connect   (%d client(s))" % count)
         try:
-            client.send(json.dumps({"type": "snapshot", "sources": snapshot()}, default=str))
+            client.send_message(first_message)
             # Nothing to read from an SSE client; a failed write (the next
             # push or heartbeat) is how a closed tab is noticed.
             client.closed.wait()
@@ -497,7 +581,7 @@ class Handler(BaseHTTPRequestHandler):
         print("ws connect    (%d client(s))" % count)
 
         try:
-            client.send(json.dumps({"type": "snapshot", "sources": snapshot()}, default=str))
+            client.send_message({"type": "snapshot", "sources": snapshot()})
             ws_read_loop(client)
         except OSError:
             pass
@@ -511,35 +595,48 @@ class Handler(BaseHTTPRequestHandler):
     # -- routes ------------------------------------------------------------
 
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        # "/api//3min/stream" and "/api/3min/" mean the same as the clean form.
+        path = re.sub(r"/{2,}", "/", self.path.split("?", 1)[0])
+        if len(path) > 1:
+            path = path.rstrip("/")
 
-        if path.rstrip("/") == "/ws":
+        if path == "/ws":
             if "websocket" in self.headers.get("Upgrade", "").lower():
                 self._handle_websocket()
             else:
                 self._send(426, b"Expected a WebSocket upgrade", "text/plain")
             return
 
-        if path.rstrip("/") == "/api/stream":
-            self._handle_stream()
+        # A browser tab opening any of the JSON URLs below gets api.html: ONE
+        # JSON document - exactly what /api (or /api/3min) returns - updated in
+        # place, instead of a frozen snapshot or a growing list of events.
+        # Scripts and apps (no text/html in Accept) and ?raw get the real
+        # thing: raw JSON, or the event stream from the /stream URLs.
+        query = self.path.split("?", 1)[1] if "?" in self.path else ""
+        wants_raw = "raw" in urllib.parse.parse_qs(query, keep_blank_values=True)
+        is_browser_tab = (not wants_raw and self.mode == "live"
+                          and "text/html" in self.headers.get("Accept", ""))
+
+        if path in LIVE_JSON_PATHS and is_browser_tab:
+            with open(os.path.join(SITE_DIR, "api.html"), "rb") as f:
+                self._send(200, f.read(), "text/html; charset=utf-8", {"Vary": "Accept"})
             return
 
-        if path.rstrip("/") == "/api/3min":
+        if path in ("/api/stream", "/api/streaming"):
+            self._handle_stream(SSEClient, {"type": "snapshot"})
+            return
+
+        if path in ("/api/3min/stream", "/api/3min/streaming"):
+            self._handle_stream(ThreeMinSSEClient, {"type": "3min"})
+            return
+
+        if path == "/api/3min":
             with THREE_MIN_LOCK:
                 body = json.dumps(THREE_MIN, default=str).encode("utf-8")
-            self._send(200, body, "application/json")
+            self._send(200, body, "application/json", {"Vary": "Accept"})
             return
 
-        if path.rstrip("/") == "/api":
-            # A browser tab opening /api gets api.html - the same JSON, kept
-            # live off /api/stream. Scripts and apps (no text/html in Accept)
-            # and /api?raw get the raw JSON as before.
-            query = self.path.split("?", 1)[1] if "?" in self.path else ""
-            wants_raw = "raw" in urllib.parse.parse_qs(query, keep_blank_values=True)
-            if not wants_raw and self.mode == "live" and "text/html" in self.headers.get("Accept", ""):
-                with open(os.path.join(SITE_DIR, "api.html"), "rb") as f:
-                    self._send(200, f.read(), "text/html; charset=utf-8", {"Vary": "Accept"})
-                return
+        if path == "/api":
             try:
                 data = dynamo_payload() if self.mode == "dynamo" else snapshot()
                 body = json.dumps(data, default=str).encode("utf-8")

@@ -36,17 +36,20 @@ const IS_LOCAL = ["localhost", "127.0.0.1", "0.0.0.0", "[::1]"].includes(locatio
 const IS_HTTP = location.protocol === "http:" || location.protocol === "https:";
 const PARAMS = new URLSearchParams(location.search);
 
-// WebSocket target, in order of preference:
-//   1. the API Gateway endpoint, once deploy.sh has filled it in (S3 hosting);
-//   2. /ws on this same origin - local_server.py, run directly or behind nginx
-//      (see deploy/), which is what makes jmd.mrpscan.com push live.
-// If the socket can't be had, the page polls the dealers itself (direct mode)
-// so the numbers never freeze. ?direct skips the socket entirely.
+// WebSocket target: /ws on this same origin - local_server.py, run directly
+// or behind nginx (see deploy/), which is what makes jmd.mrpscan.com push
+// live. If the socket can't be had, the page polls the dealers itself
+// (direct mode) so the numbers never freeze. ?direct skips the socket.
+//
+// The API Gateway socket (deploy.sh's S3 page) is opt-in with ?ws: it only
+// pushes while a 15-minute stream Lambda happens to be running and starts
+// from a DynamoDB snapshot up to 30 min old, so by default the S3 page
+// stays on direct mode, which is live every 0.5s.
 const SAME_ORIGIN_WS = IS_HTTP
   ? (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"
   : null;
 const WS_URL = PARAMS.has("direct") ? null
-  : (!IS_LOCAL && REMOTE_WS_URL.indexOf("PLACEHOLDER") === -1) ? REMOTE_WS_URL
+  : (PARAMS.has("ws") && !IS_LOCAL && REMOTE_WS_URL.indexOf("PLACEHOLDER") === -1) ? REMOTE_WS_URL
   : SAME_ORIGIN_WS;
 // /api lives next to /ws when local_server.py is the host.
 const API_URL = (IS_LOCAL || (WS_URL !== null && WS_URL === SAME_ORIGIN_WS)) ? "/api" : REMOTE_API_URL;
@@ -73,6 +76,12 @@ function fmtSigned(v) {
   const n = Number(v);
   if (Number.isNaN(n)) return String(v);
   return (n > 0 ? "+" : "") + n.toLocaleString("en-IN");
+}
+
+// Feed text is third-party: escape it before it goes into innerHTML.
+function esc(v) {
+  return String(v === null || v === undefined ? "" : v).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 function numOrNull(v) {
@@ -107,7 +116,7 @@ function createCard(src) {
 
   const rowsHtml = src.rows.map((r, i) =>
     `<tr>
-       <td class="label" data-note="row${i}">${r.label}</td>
+       <td class="label" data-note="row${i}">${esc(r.label)}</td>
        <td class="num buy" data-cell="row${i}.buy">—</td>
        <td class="num sell" data-cell="row${i}.sell">—</td>
        <td class="num hl" data-cell="row${i}.high">—</td>
@@ -116,7 +125,7 @@ function createCard(src) {
 
   el.innerHTML = `
     <h2>
-      <a href="${src.site_url}" target="_blank" rel="noopener">${src.name}</a>
+      <a href="${esc(src.site_url)}" target="_blank" rel="noopener">${esc(src.name)}</a>
       <span class="sub">
         <span class="card-dot"></span>
         <span class="card-when">—</span>
@@ -173,25 +182,25 @@ function syncAllRows(card, src) {
     "All " + rows.length + " rates published by this dealer";
   details.querySelector("tbody").innerHTML = rows.map(r =>
     `<tr>
-       <td class="label"><span class="row-id">${r.id}</span>${r.label}</td>
-       <td class="num buy" data-cell="all.${r.id}.buy">—</td>
-       <td class="num sell" data-cell="all.${r.id}.sell">—</td>
-       <td class="num hl" data-cell="all.${r.id}.high">—</td>
-       <td class="num hl" data-cell="all.${r.id}.low">—</td>
+       <td class="label"><span class="row-id">${esc(r.id)}</span>${esc(r.label)}</td>
+       <td class="num buy" data-cell="all.${esc(r.id)}.buy">—</td>
+       <td class="num sell" data-cell="all.${esc(r.id)}.sell">—</td>
+       <td class="num hl" data-cell="all.${esc(r.id)}.high">—</td>
+       <td class="num hl" data-cell="all.${esc(r.id)}.low">—</td>
      </tr>`).join("");
 }
 
 // A blank cell should say which kind of blank it is: a dealer that doesn't
 // publish the product at all, a login-only row, or no buy-back price.
 function setNote(card, key, note) {
-  const el = card.el.querySelector(`[data-note="${key}"]`);
+  const el = card.el.querySelector(`[data-note="${CSS.escape(key)}"]`);
   if (!el) return;
   el.classList.toggle("has-note", !!note);
   el.title = note || "";
 }
 
 function setCell(card, key, text, value) {
-  const cell = card.el.querySelector(`[data-cell="${key}"]`);
+  const cell = card.el.querySelector(`[data-cell="${CSS.escape(key)}"]`);
   if (!cell) return;
 
   const isBlank = text === "—";
@@ -411,7 +420,11 @@ function startDirect() {
         paintStatus();
       } catch (e) {
         if (run !== directRun) return;
-        if (state.last) applyRecord(Object.assign({}, state.last, { ok: false, error: String(e) }));
+        // Mark the card offline but keep the newest numbers on screen (they
+        // may have come from the socket since this run's state.last).
+        const card = cards.get(source.id);
+        const base = card ? card.record : state.last;
+        if (base) applyRecord(Object.assign({}, base, { ok: false, error: String(e) }));
       }
       setTimeout(tick, Math.max(0, DIRECT_MS - (Date.now() - started)));
     };
@@ -535,16 +548,23 @@ function scheduleReconnect() {
   retryMs = Math.min(retryMs * 2, everOpened ? 15000 : 60000);
 }
 
-setInterval(() => {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  if (serverHeartbeats && Date.now() - lastFrameAt > SILENT_SOCKET_MS) {
-    const dead = socket;
-    socket = null;
-    try { dead.close(); } catch (e) { /* already gone */ }
-    fallback();
-    scheduleReconnect();
-  }
-}, 5000);
+// Give up on the current socket right now: fall back first, then close it.
+// Waiting for onclose would leave the numbers frozen while a dead peer sits
+// in CLOSING (browsers wait up to 60s for the close handshake).
+function dropSocket() {
+  const dead = socket;
+  socket = null;
+  try { dead.close(); } catch (e) { /* already gone */ }
+  fallback();
+  scheduleReconnect();
+}
+
+function socketIsSilent() {
+  return serverHeartbeats && socket && socket.readyState === WebSocket.OPEN &&
+         Date.now() - lastFrameAt > SILENT_SOCKET_MS;
+}
+
+setInterval(() => { if (socketIsSilent()) dropSocket(); }, 5000);
 
 setInterval(() => {
   if (socket && socket.readyState === WebSocket.OPEN) {
@@ -554,10 +574,7 @@ setInterval(() => {
 
 // A tab coming back from sleep may hold a socket that died while it slept.
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && serverHeartbeats && socket &&
-      socket.readyState === WebSocket.OPEN && Date.now() - lastFrameAt > SILENT_SOCKET_MS) {
-    try { socket.close(); } catch (e) { /* onclose handles the rest */ }
-  }
+  if (document.visibilityState === "visible" && socketIsSilent()) dropSocket();
 });
 
 document.getElementById("refresh").addEventListener("click", load);
