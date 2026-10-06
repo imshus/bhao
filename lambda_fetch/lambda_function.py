@@ -14,6 +14,14 @@ from datetime import datetime, timedelta, timezone
 IST = timezone(timedelta(hours=5, minutes=30))
 TABLE_NAME = "gold-rate-tracker"
 
+# WebSocket push (deploy.sh sets these on the Lambda). Unset -> push is off and
+# the function just stores history, so local imports never need them.
+CONNECTIONS_TABLE = os.environ.get("CONNECTIONS_TABLE", "")
+WS_ENDPOINT = os.environ.get("WS_ENDPOINT", "")
+STREAM_SECONDS = int(os.environ.get("STREAM_SECONDS", "840"))
+POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "2"))
+CONNECTION_CHECK_SECONDS = int(os.environ.get("CONNECTION_CHECK_SECONDS", "30"))
+
 # Every source shows exactly these 3 rows, in this order. If a dealer's feed
 # doesn't publish that exact category, the row is left blank (None) rather
 # than substituting something else in.

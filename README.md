@@ -114,6 +114,37 @@ it also injects into the uploaded dashboard (replacing the
 `wss://WEBSOCKET_ENDPOINT_PLACEHOLDER` literal in `site/index.html`). Until
 that runs, the deployed page simply polls as before.
 
+### Live on our own server (jmd.mrpscan.com)
+
+`jmd.mrpscan.com` is an EC2 box running nginx. It doesn't need API Gateway or
+Lambda: `local_server.py` already is a complete WebSocket server (one poller
+thread per dealer, push on change, heartbeat every 20s), so it runs there as a
+systemd service on `127.0.0.1:7005` and nginx proxies the domain to it.
+
+1. On the server: `sudo bash server_setup.sh` (from `deploy/`; it clones or
+   pulls the repo into `/opt/bhao`, installs `gold-tracker.service`, starts it).
+2. Paste the two `location` blocks from `deploy/nginx-jmd.mrpscan.com.conf`
+   into the domain's HTTPS `server {}` block, then
+   `sudo nginx -t && sudo systemctl reload nginx`.
+3. Optional: put the Mega Bullion login in `/opt/bhao/.env` and
+   `sudo systemctl restart gold-tracker` - the server-side poller is the only
+   place those 99.50 rows can be fetched from.
+
+Updating later is just re-running step 1.
+
+How the page picks its transport, wherever it's hosted:
+
+| Situation | What the page does |
+|---|---|
+| `/ws` answers on the same origin (local_server, directly or via nginx) | WebSocket push |
+| `deploy.sh` filled in the API Gateway `wss://` URL | WebSocket push via API Gateway |
+| No socket (plain static hosting, server restarting) | polls each dealer from the browser every 0.5s, and keeps retrying the socket |
+| localhost with `--dynamo` | polls `/api` every 30s |
+
+A socket that stays open but goes silent for 60s (no heartbeat) is dropped and
+reconnected, so a stalled proxy can't freeze the numbers. `?direct` forces
+browser polling.
+
 ## What gets fetched
 
 Every row and every column each dealer publishes is captured. A feed line is

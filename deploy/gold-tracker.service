@@ -1,0 +1,19 @@
+# systemd unit for the live WebSocket server behind jmd.mrpscan.com.
+# server_setup.sh fills in __APP_DIR__ / __APP_USER__ / __PORT__ and installs
+# it as /etc/systemd/system/gold-tracker.service.
+
+[Unit]
+Description=Gold Rate Tracker - live dealer rates over WebSocket
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=__APP_USER__
+WorkingDirectory=__APP_DIR__
+ExecStart=/usr/bin/python3 __APP_DIR__/local_server.py --host 127.0.0.1 --port __PORT__
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

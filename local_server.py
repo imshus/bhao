@@ -199,12 +199,23 @@ def ws_read_loop(client):
 
 
 def keepalive_loop(stop_event):
-    """Ping idle clients so dead tabs get noticed even in a still market."""
+    """Ping idle clients so dead tabs get noticed even in a still market, and
+    send a heartbeat the page can see (pings are invisible to browser JS) so a
+    socket that silently stopped delivering - e.g. a stalled proxy - gets
+    reconnected instead of leaving the numbers frozen."""
     while not stop_event.wait(PING_EVERY_SECONDS):
         with CLIENTS_LOCK:
             targets = list(CLIENTS)
+        heartbeat = json.dumps({"type": "heartbeat", "at": now_ist()})
+        dead = []
         for c in targets:
             c.send(b"", opcode=0x9)
+            if not c.send(heartbeat):
+                dead.append(c)
+        if dead:
+            with CLIENTS_LOCK:
+                for c in dead:
+                    CLIENTS.discard(c)
 
 
 # --------------------------------------------------------------------------

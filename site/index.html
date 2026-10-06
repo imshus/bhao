@@ -33,14 +33,23 @@ const REMOTE_API_URL = "https://17gdivfex7.execute-api.ap-south-1.amazonaws.com/
 const REMOTE_WS_URL = "wss://WEBSOCKET_ENDPOINT_PLACEHOLDER";
 
 const IS_LOCAL = ["localhost", "127.0.0.1", "0.0.0.0", "[::1]"].includes(location.hostname);
-const API_URL = IS_LOCAL ? "/api" : REMOTE_API_URL;
+const IS_HTTP = location.protocol === "http:" || location.protocol === "https:";
+const PARAMS = new URLSearchParams(location.search);
 
-// local_server.py exposes /ws on the same origin; the deployed site uses the
-// API Gateway WebSocket endpoint. Either way a dropped socket falls back to
-// polling /api, so the page never depends on the socket being up.
-const WS_URL = IS_LOCAL
+// WebSocket target, in order of preference:
+//   1. the API Gateway endpoint, once deploy.sh has filled it in (S3 hosting);
+//   2. /ws on this same origin - local_server.py, run directly or behind nginx
+//      (see deploy/), which is what makes jmd.mrpscan.com push live.
+// If the socket can't be had, the page polls the dealers itself (direct mode)
+// so the numbers never freeze. ?direct skips the socket entirely.
+const SAME_ORIGIN_WS = IS_HTTP
   ? (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"
-  : (REMOTE_WS_URL.indexOf("PLACEHOLDER") === -1 ? REMOTE_WS_URL : null);
+  : null;
+const WS_URL = PARAMS.has("direct") ? null
+  : (!IS_LOCAL && REMOTE_WS_URL.indexOf("PLACEHOLDER") === -1) ? REMOTE_WS_URL
+  : SAME_ORIGIN_WS;
+// /api lives next to /ws when local_server.py is the host.
+const API_URL = (IS_LOCAL || (WS_URL !== null && WS_URL === SAME_ORIGIN_WS)) ? "/api" : REMOTE_API_URL;
 
 const POLL_MS = 30000;
 const FLASH_MS = 900;
@@ -92,6 +101,9 @@ function createCard(src) {
   const el = document.createElement("div");
   el.className = "card";
   el.dataset.source = src.source;
+  // Same order whichever transport (or dealer) answers first.
+  const order = DIRECT_SOURCES.findIndex(s => s.id === src.source);
+  el.style.order = order === -1 ? DIRECT_SOURCES.length : order;
 
   const rowsHtml = src.rows.map((r, i) =>
     `<tr>
@@ -247,16 +259,27 @@ function render(sources) {
   paintStatus();
 }
 
+// transport: "connecting" | "ws" (server push) | "direct" (browser polls the
+// dealers) | "poll" (/api every 30s - local_server --dynamo only)
+let transport = "connecting";
+
+const STATUS = {
+  connecting: ["connecting", () => "Connecting…",
+               "Connecting…"],
+  ws:         ["live", () => "Live · " + cards.size + " dealers streaming",
+               "WebSocket: the server polls each dealer and pushes a card the moment its rate moves."],
+  direct:     ["live", () => "Live · " + cards.size + " dealers (direct)",
+               "WebSocket unavailable - this browser is polling each dealer every 0.5s instead."],
+  poll:       ["polling", () => "Last refreshed " + new Date().toLocaleTimeString("en-IN"),
+               "Polling for updates every 30 seconds."],
+};
+
 function paintStatus() {
-  const dot = streaming ? "live" : "polling";
-  const text = streaming
-    ? "Live · " + cards.size + " dealers streaming"
-    : "Last refreshed " + new Date().toLocaleTimeString("en-IN");
+  const [dot, text, foot] = STATUS[transport];
   document.getElementById("updated").innerHTML =
-    `<span class="conn-dot ${dot}"></span>` + text;
-  document.getElementById("footnote").textContent = streaming
-    ? "Each dealer is polled on its own clock; a card updates the moment that dealer's rate moves."
-    : "Polling for updates every 30 seconds.";
+    `<span class="conn-dot ${dot}"></span>` + text();
+  document.getElementById("footnote").textContent = foot;
+  document.getElementById("refresh").style.display = transport === "poll" ? "" : "none";
 }
 
 async function load() {
@@ -354,29 +377,41 @@ function buildRecord(source, feedRows) {
   };
 }
 
+// Bumped on every start/stop; a tick from an older run sees the mismatch and
+// ends its loop, so stopping is immediate and a restart never doubles up.
+let directRun = 0;
+let directOn = false;
+const directState = new Map();   // source id -> {signature, last}
+
 function startDirect() {
-  streaming = true;
+  if (directOn) return;
+  directOn = true;
+  const run = ++directRun;
+  transport = "direct";
   paintStatus();
-  DIRECT_SOURCES.forEach((source, index) => {
-    let signature = null, last = null;
+  DIRECT_SOURCES.forEach(source => {
+    const state = directState.get(source.id) || { signature: null, last: null };
+    directState.set(source.id, state);
     const tick = async () => {
+      if (run !== directRun) return;
       const started = Date.now();
       try {
         const res = await fetch(source.url + "?t=" + started, { cache: "no-store" });
         if (!res.ok) throw new Error("HTTP " + res.status);
         const rec = buildRecord(source, parseFeed(await res.text()));
+        if (run !== directRun) return;   // the socket took over mid-request
         const now = new Date().toISOString();
         const sig = JSON.stringify([rec.rows, rec.all_rows]);
         rec.timestamp = now;
-        rec.changed_at = sig !== signature || !last ? now : last.changed_at;
+        rec.changed_at = sig !== state.signature || !state.last ? now : state.last.changed_at;
         rec.ok = true;
-        signature = sig;
-        last = rec;
+        state.signature = sig;
+        state.last = rec;
         applyRecord(rec);
-        cards.get(source.id).el.style.order = index;   // fixed order, whoever answers first
         paintStatus();
       } catch (e) {
-        if (last) { applyRecord(Object.assign({}, last, { ok: false, error: String(e) })); }
+        if (run !== directRun) return;
+        if (state.last) applyRecord(Object.assign({}, state.last, { ok: false, error: String(e) }));
       }
       setTimeout(tick, Math.max(0, DIRECT_MS - (Date.now() - started)));
     };
@@ -384,18 +419,42 @@ function startDirect() {
   });
 }
 
+function stopDirect() {
+  directOn = false;
+  directRun++;
+}
+
 // ---- transport: WebSocket push when we can get it, polling otherwise ----
 
 let socket = null;
-let streaming = false;
 let pollTimer = null;
 let retryMs = 1000;
+let everOpened = false;
+let lastFrameAt = 0;
+let serverHeartbeats = false;   // local_server.py sends {"type":"heartbeat"} every 20s
+
+// A socket that opens but then silently stops delivering (stalled proxy,
+// sleeping laptop) would freeze the numbers. local_server.py heartbeats every
+// 20s, so 60s of silence from it means the socket is dead: drop and reconnect.
+const SILENT_SOCKET_MS = 60000;
+// API Gateway idles a socket out after 10 minutes without client traffic.
+const CLIENT_PING_MS = 4 * 60 * 1000;
 
 function startPolling() {
+  transport = "poll";
   if (pollTimer === null) {
     load();
     pollTimer = setInterval(load, POLL_MS);
   }
+  paintStatus();
+}
+
+// What keeps the numbers moving while the socket is down: localhost polls the
+// server's /api (that's how --dynamo mode works), anywhere else the browser
+// goes straight to the dealers.
+function fallback() {
+  if (IS_LOCAL) startPolling();
+  else startDirect();
 }
 
 function stopPolling() {
@@ -410,6 +469,8 @@ function handleMessage(msg) {
   // sent on connect, a single-dealer update (local_server, one thread per
   // dealer), and a batch of dealers (the Lambda, which polls them together).
   if (Array.isArray(msg)) { render(msg); return; }
+  if (msg.type === "heartbeat") { serverHeartbeats = true; return; }
+  if (msg.type === "pong") return;
   if (msg.type === "snapshot") { render(msg.sources || []); return; }
   if (msg.type === "update") {
     const list = msg.sources || (msg.source ? [msg.source] : []);
@@ -419,22 +480,35 @@ function handleMessage(msg) {
 }
 
 function connect() {
-  if (!WS_URL) { startPolling(); return; }
+  if (!WS_URL) { fallback(); return; }
 
-  socket = new WebSocket(WS_URL);
+  let ws;
+  try {
+    ws = new WebSocket(WS_URL);
+  } catch (e) {
+    fallback();
+    scheduleReconnect();
+    return;
+  }
+  socket = ws;
 
-  socket.onopen = () => {
-    streaming = true;
+  ws.onopen = () => {
+    if (socket !== ws) return;
+    everOpened = true;
     retryMs = 1000;
+    lastFrameAt = Date.now();
     stopPolling();          // the server pushes now; no need to ask
+    stopDirect();
+    transport = "ws";
     paintStatus();
     // local_server.py pushes a snapshot on connect by itself; API Gateway has
     // to be asked for one, since $connect can't send before the handshake ends.
-    try { socket.send(JSON.stringify({ action: "snapshot" })); } catch (e) { /* no-op */ }
-    if (cards.size === 0) load();   // never leave the grid empty while waiting
+    try { ws.send(JSON.stringify({ action: "snapshot" })); } catch (e) { /* no-op */ }
   };
 
-  socket.onmessage = (ev) => {
+  ws.onmessage = (ev) => {
+    if (socket !== ws) return;
+    lastFrameAt = Date.now();
     try {
       handleMessage(JSON.parse(ev.data));
     } catch (e) {
@@ -442,32 +516,53 @@ function connect() {
     }
   };
 
-  socket.onclose = () => {
+  ws.onclose = () => {
+    if (socket !== ws) return;   // an older socket we already replaced
     socket = null;
-    streaming = false;
-    paintStatus();
-    startPolling();         // keep the numbers moving while we reconnect
-    setTimeout(connect, retryMs);
-    retryMs = Math.min(retryMs * 2, 15000);   // back off, don't hammer
+    fallback();             // keep the numbers moving while we reconnect
+    scheduleReconnect();
   };
 
-  socket.onerror = () => {
+  ws.onerror = () => {
+    try { ws.close(); } catch (e) { /* onclose handles the rest */ }
+  };
+}
+
+function scheduleReconnect() {
+  setTimeout(connect, retryMs);
+  // A host that has never accepted the socket (plain static hosting) is
+  // re-tried slowly; one that dropped a working socket is re-tried quickly.
+  retryMs = Math.min(retryMs * 2, everOpened ? 15000 : 60000);
+}
+
+setInterval(() => {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  if (serverHeartbeats && Date.now() - lastFrameAt > SILENT_SOCKET_MS) {
+    const dead = socket;
+    socket = null;
+    try { dead.close(); } catch (e) { /* already gone */ }
+    fallback();
+    scheduleReconnect();
+  }
+}, 5000);
+
+setInterval(() => {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    try { socket.send(JSON.stringify({ action: "ping" })); } catch (e) { /* onclose handles it */ }
+  }
+}, CLIENT_PING_MS);
+
+// A tab coming back from sleep may hold a socket that died while it slept.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && serverHeartbeats && socket &&
+      socket.readyState === WebSocket.OPEN && Date.now() - lastFrameAt > SILENT_SOCKET_MS) {
     try { socket.close(); } catch (e) { /* onclose handles the rest */ }
-  };
-}
+  }
+});
 
-// Localhost keeps the server's WebSocket; anywhere else the page goes
-// straight to the dealers (add ?ws to force the old WebSocket/API path).
-const DIRECT = !IS_LOCAL && !new URLSearchParams(location.search).has("ws");
-
-if (DIRECT) {
-  document.getElementById("refresh").style.display = "none";
-  startDirect();
-} else {
-  document.getElementById("refresh").addEventListener("click", load);
-  connect();
-  if (!WS_URL) startPolling();
-}
+document.getElementById("refresh").addEventListener("click", load);
+paintStatus();
+connect();
 </script>
 
 </body>
