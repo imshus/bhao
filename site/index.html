@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gold Rate Tracker | Live Rates</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <h1>Gold Rate Tracker</h1>
+</header>
+
+<div class="meta">
+  <span id="updated"><span class="conn-dot connecting"></span>Connecting…</span>
+  <button id="refresh">Refresh</button>
+</div>
+
+<main>
+  <div class="grid" id="grid"></div>
+</main>
+
+<footer id="footnote">Connecting…</footer>
+
+<script>
+// Deployed URL - deploy.sh rewrites this literal to the real API Gateway
+// endpoint when uploading to S3, so leave the string itself alone.
+const REMOTE_API_URL = "https://17gdivfex7.execute-api.ap-south-1.amazonaws.com/";
+
+// Deployed WebSocket endpoint. deploy.sh rewrites this literal too, once the
+// WebSocket API exists; until then it still says PLACEHOLDER and we just poll.
+const REMOTE_WS_URL = "wss://WEBSOCKET_ENDPOINT_PLACEHOLDER";
+
+const IS_LOCAL = ["localhost", "127.0.0.1", "0.0.0.0", "[::1]"].includes(location.hostname);
+const API_URL = IS_LOCAL ? "/api" : REMOTE_API_URL;
+
+// local_server.py exposes /ws on the same origin; the deployed site uses the
+// API Gateway WebSocket endpoint. Either way a dropped socket falls back to
+// polling /api, so the page never depends on the socket being up.
+const WS_URL = IS_LOCAL
+  ? (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"
+  : (REMOTE_WS_URL.indexOf("PLACEHOLDER") === -1 ? REMOTE_WS_URL : null);
+
+const POLL_MS = 30000;
+const FLASH_MS = 900;
+
+function fmt(v) {
+  if (v === null || v === undefined || v === "" || v === "-") return "—";
+  const str = String(v).trim();
+  const n = Number(str);
+  if (Number.isNaN(n)) return str;
+  // Keep their decimals exactly as published: 95.740 must not become 95.74.
+  const dot = str.indexOf(".");
+  const decimals = dot === -1 ? 0 : str.length - dot - 1;
+  return n.toLocaleString("en-IN", {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  });
+}
+
+function fmtSigned(v) {
+  if (v === null || v === undefined || v === "-" || v === "") return "—";
+  const n = Number(v);
+  if (Number.isNaN(n)) return String(v);
+  return (n > 0 ? "+" : "") + n.toLocaleString("en-IN");
+}
+
+function numOrNull(v) {
+  if (v === null || v === undefined || v === "" || v === "-") return null;
+  const n = Number(v);
+  return Number.isNaN(n) ? null : n;
+}
+
+function ago(iso) {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "";
+  const secs = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (secs < 60) return secs + "s ago";
+  if (secs < 3600) return Math.floor(secs / 60) + "m ago";
+  return Math.floor(secs / 3600) + "h ago";
+}
+
+// ---- cards are created once, then patched in place ----------------------
+// A full grid rebuild would throw away the DOM on every push, killing the
+// flash animation and any text selection. Each dealer now arrives on its own
+// schedule, so cards are keyed by source id and updated individually.
+
+const cards = new Map();   // source id -> {el, values:{}, record}
+
+function createCard(src) {
+  const el = document.createElement("div");
+  el.className = "card";
+  el.dataset.source = src.source;
+
+  const rowsHtml = src.rows.map((r, i) =>
+    `<tr>
+       <td class="label" data-note="row${i}">${r.label}</td>
+       <td class="num buy" data-cell="row${i}.buy">—</td>
+       <td class="num sell" data-cell="row${i}.sell">—</td>
+       <td class="num hl" data-cell="row${i}.high">—</td>
+       <td class="num hl" data-cell="row${i}.low">—</td>
+     </tr>`).join("");
+
+  el.innerHTML = `
+    <h2>
+      <a href="${src.site_url}" target="_blank" rel="noopener">${src.name}</a>
+      <span class="sub">
+        <span class="card-dot"></span>
+        <span class="card-when">—</span>
+        <span class="card-badge"></span>
+      </span>
+    </h2>
+    <div class="table-wrap">
+      <table class="rates">
+        <thead><tr><th>Product</th><th>Buy</th><th>Sell</th><th>High</th><th>Low</th></tr></thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
+    </div>
+    <div class="badla-row">
+      <div class="badla-title">Badla Bhaw</div>
+      <div class="badla-items">
+        <div class="badla-item">
+          <div class="badla-item-label">Cash</div>
+          <div class="badla-item-value" data-cell="diff1">—</div>
+        </div>
+        <div class="badla-item">
+          <div class="badla-item-label">RTGS</div>
+          <div class="badla-item-value" data-cell="diff2">—</div>
+        </div>
+      </div>
+    </div>
+    <details class="all-rows" open>
+      <summary></summary>
+      <div class="table-wrap">
+        <table class="rates feed-all">
+          <thead><tr><th>Feed row</th><th>Buy</th><th>Sell</th><th>High</th><th>Low</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </details>
+  `;
+  document.getElementById("grid").appendChild(el);
+  return { el, values: {}, record: src, allRowKey: "" };
+}
+
+// The raw feed table is rebuilt only when the set of rows changes - a dealer
+// can add or drop a row mid-session (Mega Bullion gains its 99.50 rows the
+// moment credentials resolve a customer template).
+function syncAllRows(card, src) {
+  const rows = src.all_rows || [];
+  const key = rows.map(r => r.id + ":" + r.label).join("|");
+  const details = card.el.querySelector(".all-rows");
+  if (!details) return;
+
+  details.style.display = rows.length ? "" : "none";
+  if (key === card.allRowKey) return;
+  card.allRowKey = key;
+
+  details.querySelector("summary").textContent =
+    "All " + rows.length + " rates published by this dealer";
+  details.querySelector("tbody").innerHTML = rows.map(r =>
+    `<tr>
+       <td class="label"><span class="row-id">${r.id}</span>${r.label}</td>
+       <td class="num buy" data-cell="all.${r.id}.buy">—</td>
+       <td class="num sell" data-cell="all.${r.id}.sell">—</td>
+       <td class="num hl" data-cell="all.${r.id}.high">—</td>
+       <td class="num hl" data-cell="all.${r.id}.low">—</td>
+     </tr>`).join("");
+}
+
+// A blank cell should say which kind of blank it is: a dealer that doesn't
+// publish the product at all, a login-only row, or no buy-back price.
+function setNote(card, key, note) {
+  const el = card.el.querySelector(`[data-note="${key}"]`);
+  if (!el) return;
+  el.classList.toggle("has-note", !!note);
+  el.title = note || "";
+}
+
+function setCell(card, key, text, value) {
+  const cell = card.el.querySelector(`[data-cell="${key}"]`);
+  if (!cell) return;
+
+  const isBlank = text === "—";
+  cell.textContent = text;
+  cell.classList.toggle("na", isBlank);
+
+  const before = card.values[key];
+  card.values[key] = value;
+  if (before === undefined || value === null || before === null || value === before) return;
+
+  // Flash green when it ticks up, red when it ticks down.
+  const dir = value > before ? "flash-up" : "flash-down";
+  cell.classList.remove("flash-up", "flash-down");
+  void cell.offsetWidth;            // restart the animation if it re-fires
+  cell.classList.add(dir);
+  setTimeout(() => cell.classList.remove(dir), FLASH_MS);
+}
+
+function applyRecord(src) {
+  let card = cards.get(src.source);
+  if (!card) {
+    card = createCard(src);
+    cards.set(src.source, card);
+  }
+  card.record = src;
+
+  const COLUMNS = ["buy", "sell", "high", "low"];
+
+  src.rows.forEach((r, i) => {
+    COLUMNS.forEach(col => setCell(card, "row" + i + "." + col, fmt(r[col]), numOrNull(r[col])));
+    setNote(card, "row" + i, r.note);
+  });
+
+  syncAllRows(card, src);
+  (src.all_rows || []).forEach(r => {
+    COLUMNS.forEach(col => setCell(card, "all." + r.id + "." + col, fmt(r[col]), numOrNull(r[col])));
+  });
+
+  setCell(card, "diff1", fmtSigned(src.diff1), numOrNull(src.diff1));
+  setCell(card, "diff2", fmtSigned(src.diff2), numOrNull(src.diff2));
+
+  const offline = src.ok === false;
+  card.el.classList.toggle("offline", offline);
+  const badge = card.el.querySelector(".card-badge");
+  badge.textContent = offline ? "not responding" : "";
+  badge.title = offline ? (src.error || "") : "";
+
+  paintCardTime(card);
+}
+
+function paintCardTime(card) {
+  const src = card.record;
+  const when = src.changed_at || src.timestamp;
+  const label = card.el.querySelector(".card-when");
+  if (!label) return;
+  label.textContent = "Updated " + ago(when);
+  label.title = new Date(when).toLocaleTimeString("en-IN");
+}
+
+// Keeps the "3s ago" labels honest between pushes.
+setInterval(() => cards.forEach(paintCardTime), 1000);
+
+function render(sources) {
+  sources.forEach(applyRecord);
+  paintStatus();
+}
+
+function paintStatus() {
+  const dot = streaming ? "live" : "polling";
+  const text = streaming
+    ? "Live · " + cards.size + " dealers streaming"
+    : "Last refreshed " + new Date().toLocaleTimeString("en-IN");
+  document.getElementById("updated").innerHTML =
+    `<span class="conn-dot ${dot}"></span>` + text;
+  document.getElementById("footnote").textContent = streaming
+    ? "Each dealer is polled on its own clock; a card updates the moment that dealer's rate moves."
+    : "Polling for updates every 30 seconds.";
+}
+
+async function load() {
+  try {
+    const res = await fetch(API_URL);
+    render(await res.json());
+  } catch (e) {
+    document.getElementById("updated").innerHTML =
+      '<span class="conn-dot offline"></span>Failed to load data';
+  }
+}
+
+// ---- transport: WebSocket push when we can get it, polling otherwise ----
+
+let socket = null;
+let streaming = false;
+let pollTimer = null;
+let retryMs = 1000;
+
+function startPolling() {
+  if (pollTimer === null) {
+    load();
+    pollTimer = setInterval(load, POLL_MS);
+  }
+}
+
+function stopPolling() {
+  if (pollTimer !== null) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+function handleMessage(msg) {
+  // Shapes we accept: a bare array (/api, local and deployed), the snapshot
+  // sent on connect, a single-dealer update (local_server, one thread per
+  // dealer), and a batch of dealers (the Lambda, which polls them together).
+  if (Array.isArray(msg)) { render(msg); return; }
+  if (msg.type === "snapshot") { render(msg.sources || []); return; }
+  if (msg.type === "update") {
+    const list = msg.sources || (msg.source ? [msg.source] : []);
+    list.forEach(applyRecord);
+    paintStatus();
+  }
+}
+
+function connect() {
+  if (!WS_URL) { startPolling(); return; }
+
+  socket = new WebSocket(WS_URL);
+
+  socket.onopen = () => {
+    streaming = true;
+    retryMs = 1000;
+    stopPolling();          // the server pushes now; no need to ask
+    paintStatus();
+    // local_server.py pushes a snapshot on connect by itself; API Gateway has
+    // to be asked for one, since $connect can't send before the handshake ends.
+    try { socket.send(JSON.stringify({ action: "snapshot" })); } catch (e) { /* no-op */ }
+    if (cards.size === 0) load();   // never leave the grid empty while waiting
+  };
+
+  socket.onmessage = (ev) => {
+    try {
+      handleMessage(JSON.parse(ev.data));
+    } catch (e) {
+      /* ignore a malformed frame and wait for the next push */
+    }
+  };
+
+  socket.onclose = () => {
+    socket = null;
+    streaming = false;
+    paintStatus();
+    startPolling();         // keep the numbers moving while we reconnect
+    setTimeout(connect, retryMs);
+    retryMs = Math.min(retryMs * 2, 15000);   // back off, don't hammer
+  };
+
+  socket.onerror = () => {
+    try { socket.close(); } catch (e) { /* onclose handles the rest */ }
+  };
+}
+
+document.getElementById("refresh").addEventListener("click", load);
+connect();
+if (!WS_URL) startPolling();
+</script>
+
+</body>
+</html>

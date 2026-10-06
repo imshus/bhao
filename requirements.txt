@@ -1,0 +1,6 @@
+# Only needed for running/testing the Lambda code LOCALLY on your machine.
+# AWS Lambda's Python runtime already includes boto3, so deploy.sh does NOT
+# need this file - it just zips lambda_function.py as-is.
+
+boto3
+certifi
