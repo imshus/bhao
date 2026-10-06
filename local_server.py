@@ -10,6 +10,8 @@ It serves three things on one port:
   * /ws          -> WebSocket; new rates are PUSHED the moment they change
   * /api         -> the same JSON the deployed API Gateway returns (fallback)
   * /api/3min    -> every dealer, refetched once every 3 minutes
+  * /api/stream  -> Server-Sent Events: the same pushes as /ws, over plain HTTP
+                    (/api opened in a browser tab streams off this too)
 
 About "live": the dealers' feed (Chirayu / VOTSBroadcastStreaming) has no
 WebSocket or SSE endpoint - their own LiveRates page just re-GETs the same URL
@@ -36,6 +38,7 @@ import struct
 import sys
 import threading
 import time
+import urllib.parse
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -127,7 +130,45 @@ class WSClient:
             pass
 
 
-CLIENTS = set()
+class SSEClient:
+    """One /api/stream listener (Server-Sent Events). Same send() interface as
+    WSClient, so broadcast() and keepalive_loop() push to both alike: text
+    frames become `data:` events, pings become SSE comments."""
+
+    def __init__(self, wfile):
+        self.wfile = wfile
+        self.lock = threading.Lock()
+        self.alive = True
+        self.closed = threading.Event()
+
+    def send(self, payload, opcode=0x1):
+        if opcode == 0x9:
+            chunk = b": ping\n\n"
+        elif opcode != 0x1:
+            return True
+        else:
+            if isinstance(payload, bytes):
+                payload = payload.decode("utf-8")
+            chunk = ("data: " + payload + "\n\n").encode("utf-8")
+        with self.lock:
+            if not self.alive:
+                return False
+            try:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                return True
+            except OSError:
+                self.alive = False
+                self.closed.set()
+                return False
+
+    def close(self):
+        with self.lock:
+            self.alive = False
+        self.closed.set()
+
+
+CLIENTS = set()     # WSClient and SSEClient instances
 CLIENTS_LOCK = threading.Lock()
 
 
@@ -372,14 +413,52 @@ class Handler(BaseHTTPRequestHandler):
     mode = "live"
     protocol_version = "HTTP/1.1"
 
-    def _send(self, status, body, content_type):
+    def _send(self, status, body, content_type, extra_headers=None):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Cache-Control", "no-store")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    # -- server-sent events --------------------------------------------------
+
+    def _handle_stream(self):
+        """/api/stream: the same pushes the WebSocket gets, over plain HTTP.
+        One `data:` line per message - a snapshot first, then an update per
+        dealer the moment its rate moves, and a heartbeat every 20s."""
+        if self.mode != "live":
+            self._send(501, b"Streaming disabled in --dynamo mode", "text/plain")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Accel-Buffering", "no")   # nginx: pass each event straight through
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        client = SSEClient(self.wfile)
+        with CLIENTS_LOCK:
+            CLIENTS.add(client)
+            count = len(CLIENTS)
+        print("sse connect   (%d client(s))" % count)
+        try:
+            client.send(json.dumps({"type": "snapshot", "sources": snapshot()}, default=str))
+            # Nothing to read from an SSE client; a failed write (the next
+            # push or heartbeat) is how a closed tab is noticed.
+            client.closed.wait()
+        finally:
+            with CLIENTS_LOCK:
+                CLIENTS.discard(client)
+                count = len(CLIENTS)
+            client.close()
+            print("sse disconnect (%d client(s))" % count)
 
     def do_OPTIONS(self):
         self._send(200, b"", "text/plain")
@@ -441,6 +520,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(426, b"Expected a WebSocket upgrade", "text/plain")
             return
 
+        if path.rstrip("/") == "/api/stream":
+            self._handle_stream()
+            return
+
         if path.rstrip("/") == "/api/3min":
             with THREE_MIN_LOCK:
                 body = json.dumps(THREE_MIN, default=str).encode("utf-8")
@@ -448,10 +531,19 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path.rstrip("/") == "/api":
+            # A browser tab opening /api gets api.html - the same JSON, kept
+            # live off /api/stream. Scripts and apps (no text/html in Accept)
+            # and /api?raw get the raw JSON as before.
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            wants_raw = "raw" in urllib.parse.parse_qs(query, keep_blank_values=True)
+            if not wants_raw and self.mode == "live" and "text/html" in self.headers.get("Accept", ""):
+                with open(os.path.join(SITE_DIR, "api.html"), "rb") as f:
+                    self._send(200, f.read(), "text/html; charset=utf-8", {"Vary": "Accept"})
+                return
             try:
                 data = dynamo_payload() if self.mode == "dynamo" else snapshot()
                 body = json.dumps(data, default=str).encode("utf-8")
-                self._send(200, body, "application/json")
+                self._send(200, body, "application/json", {"Vary": "Accept"})
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
                 self._send(500, body, "application/json")
@@ -462,7 +554,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # Serve out of site/ only - no traversal outside it.
         target = os.path.normpath(os.path.join(SITE_DIR, path.lstrip("/\\")))
-        if not target.startswith(SITE_DIR) or not os.path.isfile(target):
+        if not target.startswith(SITE_DIR + os.sep) or not os.path.isfile(target):
             self._send(404, b"Not found", "text/plain")
             return
 

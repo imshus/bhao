@@ -132,6 +132,19 @@ systemd service on `127.0.0.1:7005` and nginx proxies the domain to it.
 
 Updating later is just re-running step 1.
 
+Live endpoints on the server:
+
+| URL | What it gives |
+|---|---|
+| `/` | dashboard (WebSocket push) |
+| `/ws` | WebSocket: `{"type":"snapshot"}` on connect, then `{"type":"update","source":{...}}` per dealer change, `{"type":"heartbeat"}` every 20s |
+| `/api/stream` | the same messages as Server-Sent Events (`data: {...}` lines) over plain HTTPS |
+| `/api` | JSON snapshot for scripts; opened in a browser tab it streams off `/api/stream` and stays live. `/api?raw` always returns plain JSON |
+| `/api/3min` | every dealer, refetched once every 3 minutes |
+
+`/api/stream` sends `X-Accel-Buffering: no`, so nginx passes each event
+through as-is with no extra config.
+
 How the page picks its transport, wherever it's hosted:
 
 | Situation | What the page does |

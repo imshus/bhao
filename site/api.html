@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gold Rate API</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; background: Canvas; color: CanvasText;
+         font: 13px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }
+  pre { margin: 0; padding: 8px 12px; white-space: pre-wrap; word-break: break-word; }
+</style>
+</head>
+<body>
+<pre id="out">Connecting…</pre>
+<script>
+// /api opened in a browser tab gets this page instead of a frozen JSON
+// snapshot: the exact JSON /api returns, kept live by streaming /api/stream
+// (Server-Sent Events) - a snapshot first, then each dealer's record the
+// moment its rate moves. Scripts and apps calling /api still get raw JSON
+// (local_server.py decides by the Accept header; /api?raw forces raw JSON).
+const out = document.getElementById("out");
+const SILENT_MS = 60000;            // the server heartbeats every 20s
+
+let records = [];                   // same order as /api
+let last = "";
+let lastEventAt = Date.now();
+let stream = null;
+
+function paint() {
+  const text = JSON.stringify(records, null, 2);
+  // Don't wipe out text the user is selecting to copy.
+  if (text !== last && !String(window.getSelection())) {
+    last = text;
+    out.textContent = text;
+  }
+}
+
+function onMessage(ev) {
+  lastEventAt = Date.now();
+  let msg;
+  try { msg = JSON.parse(ev.data); } catch (e) { return; }
+  if (msg.type === "snapshot") {
+    records = msg.sources || [];
+  } else if (msg.type === "update") {
+    (msg.sources || (msg.source ? [msg.source] : [])).forEach(rec => {
+      const i = records.findIndex(r => r.source === rec.source);
+      if (i === -1) records.push(rec); else records[i] = rec;
+    });
+  } else {
+    return;                         // heartbeat
+  }
+  paint();
+}
+
+function openStream() {
+  if (stream) stream.close();
+  lastEventAt = Date.now();
+  stream = new EventSource("/api/stream");
+  stream.onmessage = onMessage;     // EventSource reconnects by itself on errors
+}
+
+// A stream that stays open but goes silent (stalled proxy, laptop sleep) is
+// reopened, so the tab can't sit on stale numbers.
+setInterval(() => { if (Date.now() - lastEventAt > SILENT_MS) openStream(); }, 5000);
+
+openStream();
+</script>
+</body>
+</html>
