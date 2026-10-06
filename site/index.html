@@ -24,9 +24,10 @@
 <footer id="footnote">Connecting…</footer>
 
 <script>
-// Deployed URL - deploy.sh rewrites this literal to the real API Gateway
-// endpoint when uploading to S3, so leave the string itself alone.
-const REMOTE_API_URL = "https://17gdivfex7.execute-api.ap-south-1.amazonaws.com/";
+// Where a copy of this page that is not served by local_server.py (the S3
+// page, a file:// copy) reads its JSON: the live server at jmd.mrpscan.com.
+// The old API Gateway endpoint is no longer used anywhere.
+const REMOTE_API_URL = "https://jmd.mrpscan.com/api";
 
 // Deployed WebSocket endpoint. deploy.sh rewrites this literal too, once the
 // WebSocket API exists; until then it still says PLACEHOLDER and we just poll.

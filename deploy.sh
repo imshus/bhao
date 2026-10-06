@@ -307,9 +307,9 @@ EOF
 aws s3api put-bucket-policy --bucket "$BUCKET_NAME" --policy file:///tmp/bucket-policy.json \
   --region "$REGION" --profile "$AWS_PROFILE"
 
-# Inject the real API + WebSocket URLs into the dashboard before uploading
-sed -e "s#https://17gdivfex7.execute-api.ap-south-1.amazonaws.com/#${API_ENDPOINT}/#g" \
-    -e "s#wss://WEBSOCKET_ENDPOINT_PLACEHOLDER#${WS_WSS_URL}#g" \
+# Inject the WebSocket URL into the dashboard before uploading. Its JSON API
+# stays https://jmd.mrpscan.com/api; the API Gateway URL is no longer used.
+sed -e "s#wss://WEBSOCKET_ENDPOINT_PLACEHOLDER#${WS_WSS_URL}#g" \
   site/index.html > /tmp/index.html
 
 aws s3 cp /tmp/index.html "s3://${BUCKET_NAME}/index.html" --content-type "text/html" \
