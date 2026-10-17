@@ -25,6 +25,18 @@ CONNECTION_CHECK_SECONDS = int(os.environ.get("CONNECTION_CHECK_SECONDS", "10"))
 # Every source shows exactly these 3 rows, in this order. If a dealer's feed
 # doesn't publish that exact category, the row is left blank (None) rather
 # than substituting something else in.
+#
+# Dealers name the same product differently, so two of the slots follow the
+# numbers rather than the label:
+#   Gold Future MCX  - the MCX gold quote, whatever the dealer calls it
+#                      (GOLD FUTURE, GOLD COSTING, Gold Current, INDIA GOLD).
+#   99.50 Gold RTGS  - the dealer's own RTGS row where it labels one (JMD
+#                      Patil, Shri Sai, KP Bullion). JMD's and Sai's are
+#                      GST-inclusive, about 1.03x the ex-GST 995 rate; KP's
+#                      is ex-GST. A dealer with no RTGS label but an ex-GST
+#                      995 row plus a "... WITH GST" one maps the WITH GST
+#                      row, to match JMD and Sai. The ex-GST rows stay in
+#                      all_rows.
 CANONICAL_LABELS = ["Gold Future MCX", "99.50 Gold Cash", "99.50 Gold RTGS"]
 
 SOURCES = [
@@ -94,6 +106,115 @@ SOURCES = [
             None,
         ],
     },
+    # None of the dealers below publishes a cash row - only RTGS / with-GST
+    # prices - so "99.50 Gold Cash" is blank for all of them.
+    #
+    # "extra_feeds" are the dealer's other populated templates (city tabs, a
+    # silver table) that their own page polls next to the main one. Their rows
+    # are added to all_rows tagged with "group"; the canonical rows only ever
+    # come from the main feed. "group" on the source tags the main feed's rows
+    # the same way, for dealers whose main template is one of several tabs.
+    {
+        "id": "smd_bullion",
+        "name": "SMD Bullion",
+        "url": "https://bcast.smdbullion.in:7768/VOTSBroadcastStreaming/Services/xml/GetLiveRateByTemplateID/smd",
+        "site_url": "https://smdbullion.in/",
+        "rows": [
+            {"match": "exact", "label": "GOLD COSTING"},
+            None,
+            {"match": "exact", "label": "GOLD 995 WITH GST"},
+        ],
+    },
+    {
+        "id": "shree_ram",
+        "name": "Shree Ram Jewellers",
+        "url": "https://bcast.shreeramjewellers.in:7768/VOTSBroadcastStreaming/Services/xml/GetLiveRateByTemplateID/shreeram",
+        "site_url": "https://shreeramjewellers.in/",
+        "extra_feeds": [
+            {"group": "Silver", "url": "https://bcast.shreeramjewellers.in:7768/VOTSBroadcastStreaming/Services/xml/GetLiveRateByTemplateID/shreeramsilver"},
+        ],
+        "rows": [
+            {"match": "exact", "label": "GOLD FUTURE"},
+            None,
+            {"match": "exact", "label": "GOLD 995 CAD READY with GST"},
+        ],
+    },
+    {
+        "id": "kp_bullion",
+        "name": "KP Bullion",
+        "url": "https://bcast.kpbullion.com:7768/VOTSBroadcastStreaming/Services/xml/GetLiveRateByTemplateID/kpbullion",
+        "site_url": "https://kpbullion.com/",
+        # Their page has three city tabs; the main template is the Mumbai one.
+        "group": "Mumbai",
+        "extra_feeds": [
+            {"group": "Chennai", "url": "https://bcast.kpbullion.com:7768/VOTSBroadcastStreaming/Services/xml/GetLiveRateByTemplateID/kpbullionchennai"},
+            {"group": "Hyderabad", "url": "https://bcast.kpbullion.com:7768/VOTSBroadcastStreaming/Services/xml/GetLiveRateByTemplateID/kpbullionhyderabad"},
+        ],
+        # KP's own RTGS row is ex-GST, so its RTGS Badla Bhaw sits about 3%
+        # below the dealers whose RTGS slot is GST-inclusive (see
+        # CANONICAL_LABELS). "GOLD 995 WITH GST" stays in all_rows.
+        "rows": [
+            {"match": "exact", "label": "GOLD COSTING"},
+            None,
+            {"match": "exact", "label": "GOLD 995 RTGS 1 KG"},
+        ],
+    },
+    {
+        "id": "vijaylaxmi_bullion",
+        "name": "Vijaylaxmi Bullion",
+        "url": "https://bcast.vijaylaxmibullion.com:7768/VOTSBroadcastStreaming/Services/xml/GetLiveRateByTemplateID/vijaylaxmi",
+        "site_url": "https://vijaylaxmibullion.com/LiveRates.html",
+        "extra_feeds": [
+            {"group": "Silver", "url": "https://bcast.vijaylaxmibullion.com:7768/VOTSBroadcastStreaming/Services/xml/GetLiveRateByTemplateID/vijaylaxmiSilver"},
+        ],
+        # Two costing rows: "GOLD COSTING." (trailing dot) carries the MCX
+        # bid/ask; plain "GOLD COSTING" shows one price on both sides.
+        "rows": [
+            {"match": "exact", "label": "GOLD COSTING."},
+            None,
+            {"match": "exact", "label": "GOLD 995 WITH GST"},
+        ],
+    },
+    {
+        "id": "kj_bullion",
+        "name": "KJ Bullion",
+        "url": "https://bcast.kjbullion.com:7768/VOTSBroadcastStreaming/Services/xml/GetLiveRateByTemplateID/kjbullion",
+        "site_url": "https://kjbullion.com/LiveRates.html",
+        # Besides the MCX quote, only per-gram 999 city rates - no 99.50 at all.
+        "rows": [
+            {"match": "exact", "label": "Gold Current"},
+            None,
+            None,
+        ],
+    },
+    {
+        "id": "sms_bullion",
+        "name": "SMS Bullion",
+        "url": "https://bcast.smsbullion.com:7768/VOTSBroadcastStreaming/Services/xml/GetLiveRateByTemplateID/smsbullion",
+        "site_url": "https://smsbullion.com/LiveRates.html",
+        # Besides the MCX quote, only per-gram 999 / 9999 city rates.
+        "rows": [
+            {"match": "exact", "label": "INDIA GOLD"},
+            None,
+            None,
+        ],
+    },
+    {
+        "id": "sln_bullion",
+        "name": "SLN Bullion",
+        # Port 443, not 7768: their page switched ports and 7768 no longer answers.
+        "url": "https://bcast.slnbullion.com/VOTSBroadcastStreaming/Services/xml/GetLiveRateByTemplateID/sln",
+        "site_url": "https://slnbullion.in/",
+        "extra_feeds": [
+            {"group": "MJDMA", "url": "https://bcast.slnbullion.com/VOTSBroadcastStreaming/Services/xml/GetLiveRateByTemplateID/slnmjdma"},
+        ],
+        # Besides the MCX quote, only 999 / 9999 T+1 rows.
+        "rows": [
+            {"match": "exact", "label": "India Gold"},
+            None,
+            None,
+        ],
+    },
 ]
 
 
@@ -119,6 +240,11 @@ def fetch_feed(url: str) -> str:
     req = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
     with urllib.request.urlopen(req, timeout=15, context=SSL_CONTEXT) as resp:
         return resp.read().decode("utf-8", errors="replace")
+
+
+def tag_rows(rows, group):
+    """Feed rows marked with the template they came from, as a new list."""
+    return [dict(row, group=group) if group else row for row in rows]
 
 
 def parse_feed(raw_text: str) -> list:
@@ -315,6 +441,16 @@ def build_source_record(source: dict, timestamp: str) -> dict:
     diffs["diff1"] = (s1 - s0) if (s0 is not None and s1 is not None) else None
     diffs["diff2"] = (s2 - s0) if (s2 is not None and s0 is not None) else None
 
+    # One after another, not in parallel: opening several connections to the
+    # same dealer host at once gets one of them stalled ~1s (often 3s) nearly
+    # every time, while three sequential requests take ~0.35s in total.
+    all_rows = tag_rows(feed_rows, source.get("group"))
+    for feed in source.get("extra_feeds", []):
+        try:
+            all_rows += tag_rows(parse_feed(fetch_feed(feed["url"])), feed["group"])
+        except Exception:
+            pass   # a secondary template failing drops only its own rows
+
     return {
         "source": source["id"],
         "timestamp": timestamp,
@@ -324,9 +460,9 @@ def build_source_record(source: dict, timestamp: str) -> dict:
         # Everything else the dealer publishes, untouched: spot gold/silver,
         # the USD-INR rate, silver futures/costing, bank RTGS rows, and the
         # day high/low on every one of them - not just the three canonical
-        # products mapped above.
-        "all_rows": feed_rows,
-        "row_count": len(feed_rows),
+        # products mapped above. Rows from extra_feeds carry a "group".
+        "all_rows": all_rows,
+        "row_count": len(all_rows),
         "diff1": diffs["diff1"],
         "diff2": diffs["diff2"],
     }

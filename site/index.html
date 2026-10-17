@@ -166,12 +166,19 @@ function createCard(src) {
   return { el, values: {}, record: src, allRowKey: "" };
 }
 
+// Rows from a dealer's other templates (city tabs, a silver table) carry a
+// group. It's part of the cell key, since a row id is only promised to be
+// unique within one template.
+function allCellKey(r) {
+  return "all." + (r.group ? r.group + "." : "") + r.id;
+}
+
 // The raw feed table is rebuilt only when the set of rows changes - a dealer
 // can add or drop a row mid-session (Mega Bullion gains its 99.50 rows the
 // moment credentials resolve a customer template).
 function syncAllRows(card, src) {
   const rows = src.all_rows || [];
-  const key = rows.map(r => r.id + ":" + r.label).join("|");
+  const key = rows.map(r => allCellKey(r) + ":" + r.label).join("|");
   const details = card.el.querySelector(".all-rows");
   if (!details) return;
 
@@ -181,14 +188,21 @@ function syncAllRows(card, src) {
 
   details.querySelector("summary").textContent =
     "All " + rows.length + " rates published by this dealer";
-  details.querySelector("tbody").innerHTML = rows.map(r =>
-    `<tr>
-       <td class="label"><span class="row-id">${esc(r.id)}</span>${esc(r.label)}</td>
-       <td class="num buy" data-cell="all.${esc(r.id)}.buy">—</td>
-       <td class="num sell" data-cell="all.${esc(r.id)}.sell">—</td>
-       <td class="num hl" data-cell="all.${esc(r.id)}.high">—</td>
-       <td class="num hl" data-cell="all.${esc(r.id)}.low">—</td>
-     </tr>`).join("");
+  let group;
+  details.querySelector("tbody").innerHTML = rows.map(r => {
+    const heading = r.group && r.group !== group
+      ? `<tr class="feed-group"><td colspan="5">${esc(r.group)}</td></tr>` : "";
+    group = r.group;
+    const k = esc(allCellKey(r));
+    return heading +
+      `<tr>
+         <td class="label"><span class="row-id">${esc(r.id)}</span>${esc(r.label)}</td>
+         <td class="num buy" data-cell="${k}.buy">—</td>
+         <td class="num sell" data-cell="${k}.sell">—</td>
+         <td class="num hl" data-cell="${k}.high">—</td>
+         <td class="num hl" data-cell="${k}.low">—</td>
+       </tr>`;
+  }).join("");
 }
 
 // A blank cell should say which kind of blank it is: a dealer that doesn't
@@ -237,7 +251,7 @@ function applyRecord(src) {
 
   syncAllRows(card, src);
   (src.all_rows || []).forEach(r => {
-    COLUMNS.forEach(col => setCell(card, "all." + r.id + "." + col, fmt(r[col]), numOrNull(r[col])));
+    COLUMNS.forEach(col => setCell(card, allCellKey(r) + "." + col, fmt(r[col]), numOrNull(r[col])));
   });
 
   setCell(card, "diff1", fmtSigned(src.diff1), numOrNull(src.diff1));
@@ -313,6 +327,8 @@ async function load() {
 const DIRECT_MS = 500;
 const CANONICAL_LABELS = ["Gold Future MCX", "99.50 Gold Cash", "99.50 Gold RTGS"];
 const FEED = "https://bcast.%s:7768/VOTSBroadcastStreaming/Services/xml/GetLiveRateByTemplateID/";
+// SLN serves its feed on the default HTTPS port; 7768 doesn't answer there.
+const FEED_443 = FEED.replace(":7768", "");
 const DIRECT_SOURCES = [
   { id: "jmd_patil", name: "JMD Patil", site_url: "https://jmdpatil.com/LiveRates.html",
     url: FEED.replace("%s", "jmdpatil.com") + "jmd",
@@ -328,6 +344,32 @@ const DIRECT_SOURCES = [
   { id: "shri_ganesh", name: "Shri Ganesh Bullion", site_url: "https://shriganeshbullion.com/",
     url: FEED.replace("%s", "shriganeshbullion.com") + "shriganeshbullion",
     rows: [{ label: "GOLD COSTING" }, null, null] },
+  { id: "smd_bullion", name: "SMD Bullion", site_url: "https://smdbullion.in/",
+    url: FEED.replace("%s", "smdbullion.in") + "smd",
+    rows: [{ label: "GOLD COSTING" }, null, { label: "GOLD 995 WITH GST" }] },
+  { id: "shree_ram", name: "Shree Ram Jewellers", site_url: "https://shreeramjewellers.in/",
+    url: FEED.replace("%s", "shreeramjewellers.in") + "shreeram",
+    extra_feeds: [{ group: "Silver", url: FEED.replace("%s", "shreeramjewellers.in") + "shreeramsilver" }],
+    rows: [{ label: "GOLD FUTURE" }, null, { label: "GOLD 995 CAD READY with GST" }] },
+  { id: "kp_bullion", name: "KP Bullion", site_url: "https://kpbullion.com/",
+    url: FEED.replace("%s", "kpbullion.com") + "kpbullion", group: "Mumbai",
+    extra_feeds: [{ group: "Chennai", url: FEED.replace("%s", "kpbullion.com") + "kpbullionchennai" },
+                  { group: "Hyderabad", url: FEED.replace("%s", "kpbullion.com") + "kpbullionhyderabad" }],
+    rows: [{ label: "GOLD COSTING" }, null, { label: "GOLD 995 RTGS 1 KG" }] },
+  { id: "vijaylaxmi_bullion", name: "Vijaylaxmi Bullion", site_url: "https://vijaylaxmibullion.com/LiveRates.html",
+    url: FEED.replace("%s", "vijaylaxmibullion.com") + "vijaylaxmi",
+    extra_feeds: [{ group: "Silver", url: FEED.replace("%s", "vijaylaxmibullion.com") + "vijaylaxmiSilver" }],
+    rows: [{ label: "GOLD COSTING." }, null, { label: "GOLD 995 WITH GST" }] },
+  { id: "kj_bullion", name: "KJ Bullion", site_url: "https://kjbullion.com/LiveRates.html",
+    url: FEED.replace("%s", "kjbullion.com") + "kjbullion",
+    rows: [{ label: "Gold Current" }, null, null] },
+  { id: "sms_bullion", name: "SMS Bullion", site_url: "https://smsbullion.com/LiveRates.html",
+    url: FEED.replace("%s", "smsbullion.com") + "smsbullion",
+    rows: [{ label: "INDIA GOLD" }, null, null] },
+  { id: "sln_bullion", name: "SLN Bullion", site_url: "https://slnbullion.in/",
+    url: FEED_443.replace("%s", "slnbullion.com") + "sln",
+    extra_feeds: [{ group: "MJDMA", url: FEED_443.replace("%s", "slnbullion.com") + "slnmjdma" }],
+    rows: [{ label: "India Gold" }, null, null] },
 ];
 
 function parseFeed(text) {
@@ -341,6 +383,16 @@ function parseFeed(text) {
     out.push({ id, label, buy, sell, high, low });
   });
   return out;
+}
+
+async function fetchFeed(url) {
+  const res = await fetch(url + "?t=" + Date.now(), { cache: "no-store" });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return parseFeed(await res.text());
+}
+
+function tagRows(rows, group) {
+  return group ? rows.map(r => Object.assign({}, r, { group })) : rows.slice();
 }
 
 function toInt(s) {
@@ -358,7 +410,7 @@ function rowNote(source, cfg, cells) {
   return null;
 }
 
-function buildRecord(source, feedRows) {
+function buildRecord(source, feedRows, allRows) {
   const find = label => feedRows.find(r => r.label === label) || null;
   const rows = source.rows.map((cfg, i) => {
     const cells = { buy: null, sell: null, high: null, low: null };
@@ -381,7 +433,7 @@ function buildRecord(source, feedRows) {
   const f0 = toInt(rows[0].buy), s1 = toInt(rows[1].sell), s2 = toInt(rows[2].sell);
   return {
     source: source.id, name: source.name, site_url: source.site_url,
-    rows, all_rows: feedRows,
+    rows, all_rows: allRows,
     diff1: f0 !== null && s1 !== null ? s1 - f0 : null,
     diff2: f0 !== null && s2 !== null ? s2 - f0 : null,
   };
@@ -406,9 +458,14 @@ function startDirect() {
       if (run !== directRun) return;
       const started = Date.now();
       try {
-        const res = await fetch(source.url + "?t=" + started, { cache: "no-store" });
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        const rec = buildRecord(source, parseFeed(await res.text()));
+        const feedRows = await fetchFeed(source.url);
+        const allRows = tagRows(feedRows, source.group);
+        // Extra templates one at a time, as build_source_record does: parallel
+        // requests to one dealer host stall. A failing one drops only its rows.
+        for (const extra of source.extra_feeds || []) {
+          try { allRows.push(...tagRows(await fetchFeed(extra.url), extra.group)); } catch (e) { /* skip */ }
+        }
+        const rec = buildRecord(source, feedRows, allRows);
         if (run !== directRun) return;   // the socket took over mid-request
         const now = new Date().toISOString();
         const sig = JSON.stringify([rec.rows, rec.all_rows]);

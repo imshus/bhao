@@ -4,7 +4,11 @@ import boto3
 from boto3.dynamodb.conditions import Key
 
 TABLE_NAME = "gold-rate-tracker"
-SOURCES = ["jmd_patil", "mega_bullion", "shri_sai", "shri_ganesh"]
+SOURCES = [
+    "jmd_patil", "mega_bullion", "shri_sai", "shri_ganesh",
+    "smd_bullion", "shree_ram", "kp_bullion", "vijaylaxmi_bullion",
+    "kj_bullion", "sms_bullion", "sln_bullion",
+]
 
 CORS_HEADERS = {
     "Content-Type": "application/json",

@@ -355,7 +355,9 @@ table.rates td.num,
 
 .table-wrap { overflow-x: auto; }
 
-table.rates td.num { font-size: 0.92rem; }
+/* Cells have no side padding, so on a narrow card adjacent prices would run
+   into each other ("1,47,9651,48,000") without this gap. */
+table.rates td.num { font-size: 0.92rem; padding-left: 0.6rem; }
 table.rates th { white-space: nowrap; }
 table.rates td.label { white-space: nowrap; padding-right: 0.75rem; }
 
@@ -405,6 +407,9 @@ table.feed-all td.label {
   font-size: 0.78rem;
   font-weight: 500;
   color: var(--text-muted);
+  /* Long feed labels ("GOLD 100Gms 999 (Coimbatore)(T+0)") wrap instead of
+     squeezing the number columns into each other. */
+  white-space: normal;
 }
 
 table.feed-all td.num { font-size: 0.82rem; }
@@ -419,3 +424,15 @@ table.feed-all td.hl { font-size: 0.75rem !important; }
   opacity: 0.65;
   font-variant-numeric: tabular-nums;
 }
+
+/* Heading above the rows of each extra template (city tab, silver table). */
+table.feed-all tr.feed-group td {
+  padding: 0.9rem 0 0.35rem;
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+table.feed-all tr.feed-group:first-child td { padding-top: 0.4rem; }

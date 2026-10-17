@@ -13,7 +13,7 @@ JSON API + a small live dashboard.
           v                                     v
      +---------------------------------------------+
      |        Lambda: gold-tracker-fetch           |
-     |  scrapes all 4 dealer feeds over plain HTTP |
+     |  scrapes all 11 dealer feeds over plain HTTP|
      +---------------------------------------------+
         |                                   |
         | writes history                    | pushes only what changed
@@ -39,7 +39,7 @@ back to polling the HTTP API, so the WebSocket is an upgrade, never a
 dependency.
 
 Everything runs on AWS's always-free or near-free tiers (Lambda, DynamoDB
-on-demand, API Gateway, S3, CloudFront). At this scale (4-5 sources, one
+on-demand, API Gateway, S3, CloudFront). At this scale (11 sources, one
 fetch every 30 min, occasional dashboard/API traffic) the realistic monthly
 cost is close to $0.
 
@@ -185,7 +185,54 @@ API contract holds). `all_rows` is the untouched feed: spot gold and silver in
 USD, the USD-INR rate, silver futures/costing, bank RTGS rows, and day
 high/low on every one of them.
 
-Current row counts: jmd_patil 7, mega_bullion 5, shri_sai 7, shri_ganesh 5.
+Some dealers' pages poll more than one template: KP Bullion has Mumbai /
+Chennai / Hyderabad tabs, Vijaylaxmi and Shree Ram a silver table, SLN an
+MJDMA board rate. Those are the source's `extra_feeds`; their rows are appended
+to `all_rows` with a `"group"` (`"Chennai"`, `"Silver"`, ...), and the
+dashboard shows each group under its own heading. They are fetched one after
+another, not in parallel: several simultaneous connections to one dealer host
+get one of them stalled ~1s (often 3s) almost every time, while three
+sequential requests take ~0.35s. A failing extra template only drops its own
+rows; the canonical rows always come from the main template.
+
+Current row counts: jmd_patil 7, mega_bullion 5, shri_sai 7, shri_ganesh 5,
+smd_bullion 7, shree_ram 9 + 7 silver, kp_bullion 12 Mumbai + 11 Chennai + 11
+Hyderabad, vijaylaxmi_bullion 9 + 4 silver, kj_bullion 10, sms_bullion 12,
+sln_bullion 8 + 2 MJDMA.
+
+### How the canonical rows are mapped
+
+Dealers name the same product differently, so two slots follow the numbers
+rather than the label:
+
+- **Gold Future MCX** is the MCX gold quote under whatever name the dealer
+  uses - `GOLD FUTURE`, `GOLD COSTING`, `Gold Current`, `INDIA GOLD`,
+  `India Gold`. All track the quote JMD Patil shows as `GOLD FUTURE`; a few
+  shade the bid slightly or publish their own day high/low.
+- **99.50 Gold RTGS** is the dealer's own RTGS row where it labels one:
+  JMD Patil's `99.50 GOLD (RTGS)`, Shri Sai's `Gold 9950 RTGS`, KP Bullion's
+  `GOLD 995 RTGS 1 KG`. JMD's and Sai's are GST-inclusive (about 1.03x the
+  ex-GST 995 rate), so where a dealer has no RTGS label but publishes an
+  ex-GST 995 row plus a `... WITH GST` one, the WITH GST row is mapped to
+  match them. KP's own RTGS row is ex-GST, so KP's RTGS Badla Bhaw sits about
+  3% below the other dealers'; its `GOLD 995 WITH GST` row stays in
+  `all_rows`.
+
+| Dealer | Gold Future MCX | 99.50 Gold Cash | 99.50 Gold RTGS |
+|---|---|---|---|
+| smd_bullion | `GOLD COSTING` | - | `GOLD 995 WITH GST` |
+| shree_ram | `GOLD FUTURE` | - | `GOLD 995 CAD READY with GST` |
+| kp_bullion | `GOLD COSTING` | - | `GOLD 995 RTGS 1 KG` (ex-GST, the dealer's own RTGS label) |
+| vijaylaxmi_bullion | `GOLD COSTING.` (the one with the MCX bid/ask; plain `GOLD COSTING` shows one price both sides) | - | `GOLD 995 WITH GST` |
+| kj_bullion | `Gold Current` | - | - |
+| sms_bullion | `INDIA GOLD` | - | - |
+| sln_bullion | `India Gold` | - | - |
+
+SLN's feed answers on port 443 (`https://bcast.slnbullion.com/...`); 7768
+times out for that host.
+
+`www.shrisaijewels.in/www/Login.htm` is the login page of the `shri_sai`
+dealer already tracked - same `sai` template on `bcast.shrisaijewels.in`.
 
 ### Blank cells, and why each one is blank
 
@@ -198,6 +245,9 @@ Nothing is ever substituted for a missing rate, but every blank now carries a
 | shri_sai | 99.50 Cash | dealer publishes no cash row, only RTGS |
 | shri_sai | 99.50 RTGS *buy* | dealer publishes a literal `-` there |
 | shri_ganesh | 99.50 Cash + RTGS | dealer publishes only `GOLD/SILVER COSTING` |
+| smd_bullion, shree_ram, kp_bullion, vijaylaxmi_bullion | 99.50 Cash | dealer publishes no cash row, only ex-GST and with-GST 995 |
+| smd_bullion, shree_ram | 99.50 RTGS *buy* | dealer publishes a literal `-` there |
+| kj_bullion, sms_bullion, sln_bullion | 99.50 Cash + RTGS | dealer publishes no 99.50 product, only 999 / 9999 rates |
 
 ### Mega Bullion's missing 99.50 rows
 
@@ -223,16 +273,24 @@ blank rather than invented.
 
 ### Templates that look promising but aren't
 
-Every dealer page also sets `coinsScripTemplateId`, and all four of those
-templates return **0 rows** - configured in the page, never populated on the
-server. Checked and empty, so don't re-investigate:
+Every dealer page also sets `coinsScripTemplateId`, and most pages poll a few
+more templates besides. The ones below return **0 rows** - configured in the
+page, never populated on the server. Checked and empty, so don't
+re-investigate (the populated ones are fetched as `extra_feeds`, see above):
 
-| Dealer | Second template | Result |
+| Dealer | Other templates | Result |
 |---|---|---|
 | jmd_patil | `jmdcoins` | 0 rows |
 | mega_bullion | `megasilver` | 0 rows |
 | shri_sai | `saicoins` | 0 rows |
 | shri_ganesh | `shriganeshbullioncoins` | 0 rows |
+| smd_bullion | `smdgoldcoins` | 0 rows |
+| shree_ram | `srbullion` | 0 rows (`shreeramsilver` is fetched) |
+| kp_bullion | `kpbullioncoins`, `bombayplatinum`, `dev` | 0 rows (`kpbullionchennai`, `kpbullionhyderabad` are fetched) |
+| vijaylaxmi_bullion | `vijaylaxmicoins`, `bombayplatinum`, `dev` | 0 rows (`vijaylaxmiSilver` is fetched) |
+| kj_bullion | `kjbulliongoldcoins` | 0 rows |
+| sms_bullion | `smsbullioncoins` | 0 rows |
+| sln_bullion | `coinseterna`, `rajeshwarcoins`, `silver` | 0 rows (`slnmjdma` is fetched) |
 
 ## Adding a new bullion dealer source
 
@@ -252,15 +310,20 @@ To find a new dealer's feed URL and template ID:
    ```
 3. If that returns values, fetch the feed URL directly to see their row
    labels (it's plain tab-separated text: `id, label, buy, sell, high, low`
-   per line).
+   per line). Use the port the page sets - SLN's is 443, so its URL has no
+   port at all. Also check the other templates their `js/LiveRates*.js`
+   polls (`grep GetLiveRateByTemplateID`); populated ones go in
+   `extra_feeds`.
 4. Add an entry to the `SOURCES` list in `lambda_fetch/lambda_function.py`,
    following the existing examples. Every source must map to exactly 3
    canonical rows — `Gold Future MCX`, `99.50 Gold Cash`, `99.50 Gold RTGS`
    — using `None` for any row the dealer doesn't publish (leave it blank,
-   never fabricate a number).
-5. Add the source's id to the `SOURCES` list in `lambda_api/lambda_function.py`
-   too (so the API/dashboard picks it up).
-6. Redeploy: `bash deploy.sh` (or just the two Lambda update commands if
+   never fabricate a number). See "How the canonical rows are mapped" above.
+5. Add the source's id to the `SOURCES` lists in `lambda_api/lambda_function.py`
+   and `lambda_ws/lambda_function.py`, and mirror the entry in
+   `DIRECT_SOURCES` in `site/index.html` (what the page polls itself when
+   there's no WebSocket).
+6. Redeploy: `bash deploy.sh` (or just the Lambda update commands if
    you don't want to touch anything else).
 
 Some dealers don't fit this pattern (Cloudflare-protected sites, or

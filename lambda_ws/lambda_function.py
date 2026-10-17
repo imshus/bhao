@@ -23,7 +23,11 @@ from boto3.dynamodb.conditions import Key
 
 TABLE_NAME = os.environ.get("TABLE_NAME", "gold-rate-tracker")
 CONNECTIONS_TABLE = os.environ.get("CONNECTIONS_TABLE", "gold-rate-tracker-connections")
-SOURCES = ["jmd_patil", "mega_bullion", "shri_sai", "shri_ganesh"]
+SOURCES = [
+    "jmd_patil", "mega_bullion", "shri_sai", "shri_ganesh",
+    "smd_bullion", "shree_ram", "kp_bullion", "vijaylaxmi_bullion",
+    "kj_bullion", "sms_bullion", "sln_bullion",
+]
 
 # A browser tab left open all day re-connects on its own if it drops, so a
 # couple of hours is plenty; the TTL only exists to sweep up rows whose
